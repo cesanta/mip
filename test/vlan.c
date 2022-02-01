@@ -20,7 +20,7 @@ static int fail(const char *fmt, ...) {
   exit(EXIT_FAILURE);
 }
 
-static void dump(const char *label, const uint8_t *buf, size_t len) {
+static inline void dump(const char *label, const uint8_t *buf, size_t len) {
   char *s = mg_hexdump(buf, len);
   printf("%s [%d bytes]\n%s\n", label, (int) len, s);
   free(s);
@@ -33,21 +33,27 @@ static void dbg(const char *fmt, ...) {
   va_end(ap);
 }
 
-static void snd(struct mip_if *ifp, void *buf, size_t len) {
-  LOG(LL_INFO, ("%p %p %d", ifp, buf, (int) len));
+static void snd(struct mip_if *ifp) {
+  // LOG(LL_INFO, ("%p %p %d", ifp, buf, (int) len));
+  // dump("DEV > NET", ifp->frame, ifp->frame_len);
+  pcap_inject(ifp->userdata, ifp->frame, ifp->frame_len);
+  printf("-> %lu\n", ifp->frame_len);
 }
 
 int main(int argc, char **argv) {
   const char *iface = NULL;  // Network iface
   const char *bpf = NULL;    // "host x.x.x.x or ether host ff:ff:ff:ff:ff:ff";
+  const char *mac = "11:22:33:44:55:66";
   bool verbose = false;
 
   // Parse options
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
       iface = argv[++i];
-    } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+    } else if (strcmp(argv[i], "-bpf") == 0 && i + 1 < argc) {
       bpf = argv[++i];
+    } else if (strcmp(argv[i], "-mac") == 0 && i + 1 < argc) {
+      mac = argv[++i];
     } else if (strcmp(argv[i], "-v") == 0) {
       verbose = true;
     } else {
@@ -80,12 +86,14 @@ int main(int argc, char **argv) {
   signal(SIGINT, signal_handler);
   signal(SIGTERM, signal_handler);
 
-  uint8_t obuf[2048];
+  uint8_t frame[2048];
   struct mip_if mif = {.dbg = dbg,
                        .snd = snd,
                        .userdata = ph,
-                       .obuf = obuf,
-                       .olen = sizeof(obuf)};
+                       .frame = frame,
+                       .frame_max_size = sizeof(frame)};
+  sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &mif.mac[0], &mif.mac[1],
+         &mif.mac[2], &mif.mac[3], &mif.mac[4], &mif.mac[5]);
 
   // Main loop. Listen for input from UART, PCAP, and STDIN.
   while (s_signo == 0) {
@@ -94,16 +102,18 @@ int main(int argc, char **argv) {
     FD_SET(pcap_fd, &rset);
 
     // See if there is something for us..
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 50000};
-    if (select(pcap_fd + 1, &rset, 0, 0, &tv) <= 0) continue;
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 10000};
+    if (select(pcap_fd + 1, &rset, 0, 0, &tv) < 0) continue;
 
     // Maybe there is something on the network?
     if (pcap_fd >= 0 && FD_ISSET(pcap_fd, &rset)) {
       struct pcap_pkthdr *hdr = NULL;
       const unsigned char *pkt = NULL;
       if (pcap_next_ex(ph, &hdr, &pkt) != 1) continue;  // Yea, fetch packet
+      if (hdr->len > mif.frame_max_size) hdr->len = mif.frame_max_size;
       if (verbose) dump("NET > DEV", pkt, hdr->len);
-      mip_rcv(&mif, pkt, hdr->len);
+      memcpy(mif.frame, pkt, hdr->len);
+      mip_rcv(&mif);
     }
 
     mip_poll(&mif, mg_millis());

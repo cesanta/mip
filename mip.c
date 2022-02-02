@@ -1,8 +1,15 @@
-// Copyright (c) 2021 Cesanta
+// Copyright (c) 2022 Cesanta
 // All rights reserved
 
 #include "mip.h"
+#include <stdio.h>
 #include <string.h>
+
+#ifdef MIP_ENABLE_DEBUG
+#define DBG(x) printf("%s:%-4d %-10s ", __FILE__, __LINE__, __func__), printf x
+#else
+#define DBG(x)
+#endif
 
 struct lcp {
   uint8_t addr, ctrl, proto[2], code, id, len[2];
@@ -83,43 +90,12 @@ struct dhcp {
   uint8_t options[32];
 } __attribute__((packed));
 
-struct arp_entry {
-  uint8_t mac[6];
-  uint32_t ip;
-} __attribute__((packed));
-
 #define U16(ptr) ((((uint16_t) (ptr)[0]) << 8) | (ptr)[1])
 #define NET16(x) __builtin_bswap16(x)
 #define NET32(x) __builtin_bswap32(x)
 
-#define CNIP_ARP_CACHE_SIZE 10
-static struct arp_entry s_arp_cache[CNIP_ARP_CACHE_SIZE];  // ARP cache
-static size_t s_arp_idx;                                   // Current ARP index
-
-static void mip_arp(struct mip_if *ifp, struct eth *eth, struct arp *arp) {
-  if (arp->op == NET16(1) && arp->tpa == ifp->ip) {
-    // ARP request. Edit packet in-place. Make a response, then send
-    memcpy(eth->dst, eth->src, sizeof(eth->dst));
-    memcpy(eth->src, ifp->mac, sizeof(eth->src));
-    arp->op = NET16(2);
-    memcpy(arp->tha, arp->sha, sizeof(arp->tha));
-    memcpy(arp->sha, ifp->mac, sizeof(arp->sha));
-    arp->tpa = arp->spa;
-    arp->spa = ifp->ip;
-    ifp->dbg("%s", "ARP response\n");
-    ifp->frame_len = sizeof(*eth) + sizeof(*arp);
-    ifp->snd(ifp);
-  } else if (arp->op == NET16(2)) {
-    // ARP response
-    if (memcmp(arp->tha, ifp->mac, sizeof(arp->tha)) != 0) return;
-    // s_arp_cache[s_arp_idx++] = *(struct arp_entry *) (void *) &arp->sha;
-    (void) s_arp_cache;
-    if (s_arp_idx >= CNIP_ARP_CACHE_SIZE) s_arp_idx = 0;
-  }
-}
-
 static uint32_t csumup(uint32_t sum, const void *buf, size_t len) {
-  const uint8_t *p = buf;
+  const uint8_t *p = (const uint8_t *) buf;
   for (size_t i = 0; i < len; i++) sum += i & 1 ? p[i] : (p[i] << 8);
   return sum;
 }
@@ -134,88 +110,53 @@ static uint16_t ipcsum(const void *buf, size_t len) {
   return csumfin(sum);
 }
 
-static void mip_icmp(struct mip_if *ifp, struct eth *eth, struct ip *ip,
-                     struct icmp *icmp, size_t len) {
-  if (icmp->type == 8) {
-    memcpy(eth->dst, eth->src, sizeof(eth->dst));
-    memcpy(eth->src, ifp->mac, sizeof(eth->src));
-    ip->dst = ip->src;
-    ip->src = ifp->ip;
-    ip->csum = 0;  // Important - clear csum before recomputing
-    ip->csum = ipcsum(ip, sizeof(*ip));
-    icmp->type = 0;
-    icmp->csum = 0;  // Important - clear csum before recomputing
-    icmp->csum = ipcsum(icmp, sizeof(*icmp) + len);
-    ifp->frame_len = (size_t) ((char *) (icmp + 1) - (char *) eth) + len;
-    // ifp->dbg("ICMP response %d\n", ifp->frame_len);
-    ifp->snd(ifp);
-  }
+// ARP cache is organised as a doubly linked list. A successful cache lookup
+// moves an entry to the head of the list. New entries are added by replacing
+// the last entry in the list with a new IP/MAC.
+// ARP cache format: | prev | next | Entry0 | Entry1 | .... | EntryN |
+// ARP entry format: | prev | next | IP (4bytes) | MAC (6bytes) |
+// prev and next are 1-byte offsets in the cache, so cache size is max 256 bytes
+// ARP entry size is 12 bytes
+static void arp_cache_init(uint8_t *p, int n, int size) {
+  for (int i = 0; i < n; i++) p[2 + i * size] = 2 + (i - 1) * size;
+  for (int i = 0; i < n; i++) p[3 + i * size] = 2 + (i + 1) * size;
+  p[0] = p[2] = 2 + (n - 1) * size;
+  p[1] = p[3 + (n - 1) * size] = 2;
 }
 
-static void mip_dhcp(struct mip_if *ifp, struct dhcp *dhcp, size_t len) {
-  uint32_t ip = ifp->ip;
-  uint8_t *p = dhcp->options, *end = ((uint8_t *) dhcp) + len;
-  if (len < sizeof(*dhcp)) return;
-  while (p < end && p[0] != 255) {
-    if (p[0] == 1 && p[1] == sizeof(ifp->mask)) {
-      memcpy(&ifp->mask, p + 2, sizeof(ifp->mask));
-      ifp->dbg("MASK %x\n", ifp->mask);
-    } else if (p[0] == 3 && p[1] == sizeof(ifp->gw)) {
-      memcpy(&ifp->gw, p + 2, sizeof(ifp->gw));
-      ifp->ip = dhcp->yiaddr;
-      ifp->dbg("IP %x GW %x\n", ifp->ip, ifp->gw);
+static uint8_t *arp_cache_find(struct mip_if *ifp, uint32_t ip) {
+  uint8_t *p = ifp->arp_cache;
+  if (p[0] == 0 || p[1] == 0) arp_cache_init(p, MIP_ARP_ENTRIES, 12);
+  for (int i = 0, j = p[1]; i < MIP_ARP_ENTRIES; i++, j = p[j + 1]) {
+    if (memcmp(p + j + 2, &ip, sizeof(ip)) == 0) {
+      p[1] = j, p[0] = p[j];  // Found entry! Point list head to us
+      return p + j + 6;       // And return MAC address
     }
-    p += p[1] + 2;
   }
-  ifp->dbg("DHCP!!!!!");
-  if (ip == 0 && ifp->ip) {
-  }
+  return NULL;
 }
 
-static void mip_ip(struct mip_if *ifp, struct eth *eth, struct ip *ip,
-                   size_t len) {
-  if (ip->proto == 1) {
-    struct icmp *icmp = (struct icmp *) (ip + 1);
-    if (len < sizeof(*icmp)) return;
-    ifp->dbg("ICMP %d\n", len);
-    mip_icmp(ifp, eth, ip, icmp, len - sizeof(*icmp));
-  } else if (ip->proto == 17) {
-    struct udp *udp = (struct udp *) (ip + 1);
-    if (len < sizeof(*udp)) return;
-    if (udp->dport == NET16(68))
-      mip_dhcp(ifp, (struct dhcp *) (udp + 1), len - sizeof(*udp));
-  }
-}
-
-void mip_rcv(struct mip_if *ifp) {
-  // ifp->dbg("got frame %u bytes\n", len);
-  size_t len = ifp->frame_len;
-  struct eth *eth = (struct eth *) ifp->frame;
-  if (len < sizeof(*eth)) return;  // Truncated packet - runt?
-  if (eth->type == NET16(0x806)) {
-    struct arp *arp = (struct arp *) (eth + 1);
-    if (sizeof(*eth) + sizeof(*arp) > len) return;  // Truncated
-    ifp->dbg("ARP %d\n", len);
-    mip_arp(ifp, eth, arp);
-  } else if (eth->type == NET16(0x800)) {
-    struct ip *ip = (struct ip *) (eth + 1);
-    if (len < sizeof(*eth) + sizeof(*ip)) return;  // Truncated packed
-    if (ip->ver != 0x45) return;                   // Not IP
-    ifp->dbg("IP %d\n", len);
-    mip_ip(ifp, eth, ip, len - sizeof(*eth) - sizeof(*ip));
-  }
+static void arp_cache_add(struct mip_if *ifp, uint32_t ip, uint8_t mac[6]) {
+  uint8_t *p = ifp->arp_cache;
+  if (arp_cache_find(ifp, ip) != NULL) return;  // Already exists, do nothing
+  memcpy(p + p[0] + 2, &ip, sizeof(ip));  // Replace last entry: IP address
+  memcpy(p + p[0] + 6, mac, 6);           // And MAC address
+  p[1] = p[0], p[0] = p[p[1]];            // Point list head to us
+  DBG(("ARP cache: added %#x\n", ip));
 }
 
 static struct ip *tx_ip(struct mip_if *ifp, uint8_t proto, uint32_t ip_src,
                         uint32_t ip_dst, size_t plen) {
   struct eth *eth = (struct eth *) ifp->frame;
   struct ip *ip = (struct ip *) (eth + 1);
-  if (ip_dst == 0xffffffff) memset(eth->dst, 255, sizeof(eth->dst));
+  uint8_t *mac = arp_cache_find(ifp, ip_dst);
+  if (mac) memcpy(eth->dst, mac, sizeof(eth->dst));
+  if (!mac) memset(eth->dst, 255, sizeof(eth->dst));
   memcpy(eth->src, ifp->mac, sizeof(eth->src));
   eth->type = NET16(0x800);
   ip->ver = 0x45;
   ip->tos = 0x0;
-  ip->len = NET16(plen);
+  ip->len = NET16(sizeof(*ip) + plen);
   ip->id = 0;
   ip->frag = 0;
   ip->ttl = 255;
@@ -241,34 +182,147 @@ static void tx_udp(struct mip_if *ifp, uint32_t ip_src, uint32_t ip_dst,
   cs = csumup(cs, &ip->dst, sizeof(ip->dst));
   cs += ip->proto + sizeof(*udp) + len;
   udp->csum = csumfin(cs);
-  memcpy(udp + 1, buf, len);
+  memmove(udp + 1, buf, len);
   ifp->frame_len = sizeof(struct eth) + sizeof(*ip) + sizeof(*udp) + len;
-  ifp->snd(ifp);
+  // DBG(("UDP LEN %d %d\n", (int) len, (int) ifp->frame_len));
+  ifp->tx(ifp);
 }
 
-static void tx_dhcp(struct mip_if *ifp, uint8_t *opts, size_t optslen) {
-  struct dhcp dhcp = {
-      .op = 1, .htype = 1, .hlen = 6, .magic = NET32(0x63825363)};
-  memcpy(dhcp.hwaddr, ifp->mac, sizeof(ifp->mac));
-  memcpy(&dhcp.xid, ifp->mac + 2, sizeof(dhcp.xid));
-  memcpy(dhcp.options, opts, optslen);
-  tx_udp(ifp, 0, 0xffffffff, 68, 67, &dhcp, sizeof(dhcp));
+static void tx_dhcp(struct mip_if *ifp, uint32_t src, uint32_t dst,
+                    uint8_t *opts, size_t optslen) {
+  struct dhcp *dhcp = (struct dhcp *) (ifp->frame + sizeof(struct eth) +
+                                       sizeof(struct ip) + sizeof(struct udp));
+  memset(dhcp, 0, sizeof(*dhcp));
+  dhcp->op = 1;
+  dhcp->htype = 1;
+  dhcp->hlen = 6;
+  dhcp->magic = NET32(0x63825363);
+  dhcp->ciaddr = src;
+  memcpy(dhcp->hwaddr, ifp->mac, sizeof(ifp->mac));
+  memcpy(&dhcp->xid, ifp->mac + 2, sizeof(dhcp->xid));
+  memcpy(dhcp->options, opts, optslen);
+  tx_udp(ifp, src, dst, 68, 67, dhcp, sizeof(*dhcp));
+}
+
+static void tx_dhcp_request(struct mip_if *ifp, uint32_t src, uint32_t dst) {
+  uint8_t opts[] = {
+      53, 1, 3,                 // Type: DHCP request
+      55, 2, 1,   3,            // GW and mask
+      12, 3, 'm', 'i', 'p',     // Host name: "mip"
+      54, 4, 0,   0,   0,   0,  // DHCP server ID
+      50, 4, 0,   0,   0,   0,  // Requested IP
+      255                       // End of options
+  };
+  memcpy(opts + 14, &dst, sizeof(dst));
+  memcpy(opts + 20, &src, sizeof(src));
+  tx_dhcp(ifp, 0, 0xffffffff, opts, sizeof(opts));
 }
 
 static void tx_dhcp_discover(struct mip_if *ifp) {
   uint8_t opts[] = {
-      53, 1, 1,                      // Type: DHCP discover
-      55, 3, 1, 3,   6,              // Parameters: ip, mask, DNS server
-      61, 7, 1, 0,   0, 0, 0, 0, 0,  // Client ID: ether + mac addr
-      57, 2, 5, 220,                 // Max message size: 1500
-      255                            // End of options
+      53, 1, 1,     // Type: DHCP discover
+      55, 3, 1, 3,  // Parameters: ip, mask
+      255           // End of options
   };
-  memcpy(opts + 11, ifp->mac, sizeof(ifp->mac));
-  tx_dhcp(ifp, opts, sizeof(opts));
+  tx_dhcp(ifp, 0, 0xffffffff, opts, sizeof(opts));
+}
+
+static void rx_arp(struct mip_if *ifp, struct eth *eth, struct arp *arp) {
+  // DBG(("ARP op %d %#x %#x\n", NET16(arp->op), arp->spa, arp->tpa));
+  if (arp->op == NET16(1) && arp->tpa == ifp->ip) {
+    // ARP request. Edit packet in-place. Make a response, then send
+    memcpy(eth->dst, eth->src, sizeof(eth->dst));
+    memcpy(eth->src, ifp->mac, sizeof(eth->src));
+    arp->op = NET16(2);
+    memcpy(arp->tha, arp->sha, sizeof(arp->tha));
+    memcpy(arp->sha, ifp->mac, sizeof(arp->sha));
+    arp->tpa = arp->spa;
+    arp->spa = ifp->ip;
+    DBG(("ARP response: we're %#x\n", ifp->ip));
+    ifp->frame_len = sizeof(*eth) + sizeof(*arp);
+    ifp->tx(ifp);
+  } else if (arp->op == NET16(2)) {
+    if (memcmp(arp->tha, ifp->mac, sizeof(arp->tha)) != 0) return;
+    arp_cache_add(ifp, arp->tpa, arp->tha);
+  }
+}
+
+static void rx_icmp(struct mip_if *ifp, struct eth *eth, struct ip *ip,
+                    struct icmp *icmp, size_t len) {
+  DBG(("ICMP %d\n", (int) len));
+  if (icmp->type == 8 && ip->dst == ifp->ip) {
+    memcpy(eth->dst, eth->src, sizeof(eth->dst));
+    memcpy(eth->src, ifp->mac, sizeof(eth->src));
+    ip->dst = ip->src;
+    ip->src = ifp->ip;
+    ip->csum = 0;  // Important - clear csum before recomputing
+    ip->csum = ipcsum(ip, sizeof(*ip));
+    icmp->type = 0;
+    icmp->csum = 0;  // Important - clear csum before recomputing
+    icmp->csum = ipcsum(icmp, sizeof(*icmp) + len);
+    ifp->frame_len = sizeof(*eth) + sizeof(*ip) + sizeof(*icmp) + len;
+    DBG(("ICMP response %d\n", (int) ifp->frame_len));
+    ifp->tx(ifp);
+  }
+}
+
+static void rx_dhcp(struct mip_if *ifp, struct dhcp *dhcp, size_t len) {
+  uint32_t ip = 0, gw = 0, mask = 0;
+  uint8_t *p = dhcp->options, *end = ((uint8_t *) dhcp) + len;
+  if (len < sizeof(*dhcp)) return;
+  while (p < end && p[0] != 255) {
+    if (p[0] == 1 && p[1] == sizeof(ifp->mask)) {
+      memcpy(&mask, p + 2, sizeof(mask));
+      // DBG(("MASK %x\n", mask));
+    } else if (p[0] == 3 && p[1] == sizeof(ifp->gw)) {
+      memcpy(&gw, p + 2, sizeof(gw));
+      ip = dhcp->yiaddr;
+      // DBG(("IP %x GW %x\n", ip, gw));
+    }
+    p += p[1] + 2;
+  }
+  if (ip && mask && gw && ifp->ip == 0) {
+    DBG(("DHCP request ip %#x mask %#x gw %#x\n", ip, mask, gw));
+    arp_cache_add(ifp, dhcp->siaddr, ((struct eth *) ifp->frame)->src);
+    ifp->ip = ip, ifp->gw = gw, ifp->mask = mask;
+    tx_dhcp_request(ifp, ip, dhcp->siaddr);
+  }
+}
+
+static void rx_ip(struct mip_if *ifp, struct eth *eth, struct ip *ip,
+                  size_t len) {
+  // DBG(("IP %d\n", (int) len));
+  if (ip->proto == 1) {
+    struct icmp *icmp = (struct icmp *) (ip + 1);
+    if (len < sizeof(*icmp)) return;
+    rx_icmp(ifp, eth, ip, icmp, len - sizeof(*icmp));
+  } else if (ip->proto == 17) {
+    struct udp *udp = (struct udp *) (ip + 1);
+    if (len < sizeof(*udp)) return;
+    if (udp->dport == NET16(68))
+      rx_dhcp(ifp, (struct dhcp *) (udp + 1), len - sizeof(*udp));
+  }
+}
+
+void mip_rx(struct mip_if *ifp) {
+  // DBG(("gt frame %u bytes\n", len));
+  size_t len = ifp->frame_len;
+  struct eth *eth = (struct eth *) ifp->frame;
+  if (len < sizeof(*eth)) return;  // Truncated packet - runt?
+  if (eth->type == NET16(0x806)) {
+    struct arp *arp = (struct arp *) (eth + 1);
+    if (sizeof(*eth) + sizeof(*arp) > len) return;  // Truncated
+    rx_arp(ifp, eth, arp);
+  } else if (eth->type == NET16(0x800)) {
+    struct ip *ip = (struct ip *) (eth + 1);
+    if (len < sizeof(*eth) + sizeof(*ip)) return;  // Truncated packed
+    if (ip->ver != 0x45) return;                   // Not IP
+    rx_ip(ifp, eth, ip, len - sizeof(*eth) - sizeof(*ip));
+  }
 }
 
 void mip_poll(struct mip_if *ifp, uint64_t uptime_ms) {
-  // ifp->dbg("poll: %p %lld\n", ifp, uptime_ms);
+  // DBG(("poll: %p %lld\n", ifp, uptime_ms));
   if (ifp->ip == 0 && uptime_ms > ifp->timer) {
     tx_dhcp_discover(ifp);
     ifp->timer = uptime_ms + 3000;

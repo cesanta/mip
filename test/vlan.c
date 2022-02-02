@@ -26,24 +26,16 @@ static inline void dump(const char *label, const uint8_t *buf, size_t len) {
   free(s);
 }
 
-static void dbg(const char *fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  vprintf(fmt, ap);
-  va_end(ap);
-}
-
-static void snd(struct mip_if *ifp) {
-  // LOG(LL_INFO, ("%p %p %d", ifp, buf, (int) len));
+static void tx(struct mip_if *ifp) {
   // dump("DEV > NET", ifp->frame, ifp->frame_len);
   pcap_inject(ifp->userdata, ifp->frame, ifp->frame_len);
-  printf("-> %lu\n", ifp->frame_len);
+  // printf("-> %lu\n", ifp->frame_len);
 }
 
 int main(int argc, char **argv) {
   const char *iface = NULL;  // Network iface
   const char *bpf = NULL;    // "host x.x.x.x or ether host ff:ff:ff:ff:ff:ff";
-  const char *mac = "11:22:33:44:55:66";
+  const char *mac = "aa:bb:cc:dd:ee:ff";
   bool verbose = false;
 
   // Parse options
@@ -87,8 +79,7 @@ int main(int argc, char **argv) {
   signal(SIGTERM, signal_handler);
 
   uint8_t frame[2048];
-  struct mip_if mif = {.dbg = dbg,
-                       .snd = snd,
+  struct mip_if mif = {.tx = tx,
                        .userdata = ph,
                        .frame = frame,
                        .frame_max_size = sizeof(frame)};
@@ -111,9 +102,10 @@ int main(int argc, char **argv) {
       const unsigned char *pkt = NULL;
       if (pcap_next_ex(ph, &hdr, &pkt) != 1) continue;  // Yea, fetch packet
       if (hdr->len > mif.frame_max_size) hdr->len = mif.frame_max_size;
-      if (verbose) dump("NET > DEV", pkt, hdr->len);
-      memcpy(mif.frame, pkt, hdr->len);
-      mip_rcv(&mif);
+      mif.frame_len = hdr->len;
+      memcpy(mif.frame, pkt, mif.frame_len);
+      if (verbose) dump("NET > DEV", mif.frame, mif.frame_len);
+      mip_rx(&mif);
     }
 
     mip_poll(&mif, mg_millis());

@@ -131,16 +131,16 @@ static uint16_t ipcsum(const void *buf, size_t len) {
 // prev and next are 1-byte offsets in the cache, so cache size is max 256 bytes
 // ARP entry size is 12 bytes
 static void arp_cache_init(uint8_t *p, int n, int size) {
-  for (int i = 0; i < n; i++) p[2 + i * size] = 2 + (i - 1) * size;
-  for (int i = 0; i < n; i++) p[3 + i * size] = 2 + (i + 1) * size;
-  p[0] = p[2] = 2 + (n - 1) * size;
+  for (int i = 0; i < n; i++) p[2 + i * size] = (uint8_t) (2 + (i - 1) * size);
+  for (int i = 0; i < n; i++) p[3 + i * size] = (uint8_t) (2 + (i + 1) * size);
+  p[0] = p[2] = (uint8_t) (2 + (n - 1) * size);
   p[1] = p[3 + (n - 1) * size] = 2;
 }
 
 static uint8_t *arp_cache_find(struct mip_if *ifp, uint32_t ip) {
   uint8_t *p = ifp->arp_cache;
   if (p[0] == 0 || p[1] == 0) arp_cache_init(p, MIP_ARP_ENTRIES, 12);
-  for (int i = 0, j = p[1]; i < MIP_ARP_ENTRIES; i++, j = p[j + 1]) {
+  for (uint8_t i = 0, j = p[1]; i < MIP_ARP_ENTRIES; i++, j = p[j + 1]) {
     if (memcmp(p + j + 2, &ip, sizeof(ip)) == 0) {
       p[1] = j, p[0] = p[j];  // Found entry! Point list head to us
       return p + j + 6;       // And return MAC address
@@ -169,7 +169,7 @@ static struct ip *tx_ip(struct mip_if *ifp, uint8_t proto, uint32_t ip_src,
   eth->type = NET16(0x800);
   ip->ver = 0x45;
   ip->tos = 0x0;
-  ip->len = NET16(sizeof(*ip) + plen);
+  ip->len = NET16((uint16_t) (sizeof(*ip) + plen));
   ip->id = 0;
   ip->frag = 0;
   ip->ttl = 255;
@@ -187,7 +187,7 @@ static void tx_udp(struct mip_if *ifp, uint32_t ip_src, uint32_t ip_dst,
   struct udp *udp = (struct udp *) (ip + 1);
   udp->sport = NET16(sport);
   udp->dport = NET16(dport);
-  udp->len = NET16(sizeof(*udp) + len);
+  udp->len = NET16((uint16_t) (sizeof(*udp) + len));
   udp->csum = 0;
   uint32_t cs = csumup(0, udp, sizeof(*udp));
   cs = csumup(cs, buf, len);

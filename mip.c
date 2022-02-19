@@ -18,10 +18,11 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifdef MIP_ENABLE_DEBUG
-#define DBG(x) printf("%s:%-4d %-10s ", __FILE__, __LINE__, __func__), printf x
+#ifdef MIP_DEBUG
+#define DBG(x) printf x
 #else
-#define DBG(x)
+#define DBG(x) \
+  if (0) printf x
 #endif
 
 struct lcp {
@@ -155,7 +156,7 @@ static void arp_cache_add(struct mip_if *ifp, uint32_t ip, uint8_t mac[6]) {
   memcpy(p + p[0] + 2, &ip, sizeof(ip));  // Replace last entry: IP address
   memcpy(p + p[0] + 6, mac, 6);           // And MAC address
   p[1] = p[0], p[0] = p[p[1]];            // Point list head to us
-  DBG(("ARP cache: added %#x\n", ip));
+  DBG(("ARP cache: added %#lx\n", (long) ip));
 }
 
 static struct ip *tx_ip(struct mip_if *ifp, uint8_t proto, uint32_t ip_src,
@@ -234,7 +235,7 @@ static void tx_dhcp_request(struct mip_if *ifp, uint32_t src, uint32_t dst) {
 static void tx_dhcp_discover(struct mip_if *ifp) {
   uint8_t opts[] = {
       53, 1, 1,     // Type: DHCP discover
-      55, 3, 1, 3,  // Parameters: ip, mask
+      55, 2, 1, 3,  // Parameters: ip, mask
       255           // End of options
   };
   tx_dhcp(ifp, 0, 0xffffffff, opts, sizeof(opts));
@@ -251,7 +252,7 @@ static void rx_arp(struct mip_if *ifp, struct eth *eth, struct arp *arp) {
     memcpy(arp->sha, ifp->mac, sizeof(arp->sha));
     arp->tpa = arp->spa;
     arp->spa = ifp->ip;
-    DBG(("ARP response: we're %#x\n", ifp->ip));
+    DBG(("ARP response: we're %#lx\n", (long) ifp->ip));
     ifp->frame_len = sizeof(*eth) + sizeof(*arp);
     ifp->tx(ifp);
   } else if (arp->op == NET16(2)) {
@@ -283,6 +284,7 @@ static void rx_dhcp(struct mip_if *ifp, struct dhcp *dhcp, size_t len) {
   uint32_t ip = 0, gw = 0, mask = 0;
   uint8_t *p = dhcp->options, *end = ((uint8_t *) dhcp) + len;
   if (len < sizeof(*dhcp)) return;
+  DBG(("DHCP %u\n", (unsigned) len));
   while (p < end && p[0] != 255) {
     if (p[0] == 1 && p[1] == sizeof(ifp->mask)) {
       memcpy(&mask, p + 2, sizeof(mask));
@@ -295,7 +297,8 @@ static void rx_dhcp(struct mip_if *ifp, struct dhcp *dhcp, size_t len) {
     p += p[1] + 2;
   }
   if (ip && mask && gw && ifp->ip == 0) {
-    DBG(("DHCP request ip %#x mask %#x gw %#x\n", ip, mask, gw));
+    DBG(("DHCP request ip %#lx mask %#lx gw %#lx\n", (long) ip, (long) mask,
+         (long) gw));
     arp_cache_add(ifp, dhcp->siaddr, ((struct eth *) ifp->frame)->src);
     ifp->ip = ip, ifp->gw = gw, ifp->mask = mask;
     tx_dhcp_request(ifp, ip, dhcp->siaddr);
@@ -312,6 +315,7 @@ static void rx_ip(struct mip_if *ifp, struct eth *eth, struct ip *ip,
   } else if (ip->proto == 17) {
     struct udp *udp = (struct udp *) (ip + 1);
     if (len < sizeof(*udp)) return;
+    // DBG(("  UDP %u %u -> %u\n", len, NET16(udp->sport), NET16(udp->dport)));
     if (udp->dport == NET16(68))
       rx_dhcp(ifp, (struct dhcp *) (udp + 1), len - sizeof(*udp));
   }
@@ -331,6 +335,8 @@ void mip_rx(struct mip_if *ifp) {
     if (len < sizeof(*eth) + sizeof(*ip)) return;  // Truncated packed
     if (ip->ver != 0x45) return;                   // Not IP
     rx_ip(ifp, eth, ip, len - sizeof(*eth) - sizeof(*ip));
+  } else {
+    DBG(("  Unknown eth type %x\n", NET16(eth->type)));
   }
 }
 

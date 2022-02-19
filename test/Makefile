@@ -1,7 +1,7 @@
 MDIR ?= ../../mongoose
 WARN ?= -W -Wall -Wextra -Werror -Wundef -Wshadow -Wdouble-promotion -Wno-missing-field-initializers
 OPTS ?= -g3 -Os
-DEFS ?= -DMIP_ENABLE_DEBUG
+DEFS ?= -DMIP_DEBUG
 INCL ?= -I.. -I$(MDIR)
 LIBS ?= -lpcap
 NIF  ?= vlan1 # wlp0s20f3
@@ -12,16 +12,16 @@ CFLAGS ?= $(WARN) $(OPTS) $(INCL) $(DEFS)
 all: test cpp vlan
 
 test:
-	$(CC) $(CFLAGS) unit_test.c -o ut
-	$(RUN) ./ut
+	$(CC) $(CFLAGS) unit_test.c -o /tmp/ut
+	$(RUN) /tmp/ut
 
 cpp:
-	$(CXX) $(CFLAGS) unit_test.c -o ut
-	$(RUN) ./ut
+	$(CXX) $(CFLAGS) unit_test.c -o /tmp/ut
+	$(RUN) /tmp/ut
 
 vlan: vlan.c ../mip.c $(MDIR)/mongoose.c
-	$(CC) $? $(CFLAGS) $(LIBS) -o vlan
-	$(RUN) sudo ./vlan $(ARGS)
+	$(CC) $? $(CFLAGS) $(LIBS) -o /tmp/vlan
+	$(RUN) sudo /tmp/vlan $(ARGS)
 
 clean:
-	rm -rf vlan ut *.dSYM *.o *.obj _CL*
+	rm -rf /tmp/vlan /tmp/ut *.dSYM *.o *.obj _CL*

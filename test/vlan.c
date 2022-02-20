@@ -105,13 +105,14 @@ int main(int argc, char **argv) {
 
     // See if there is something for us..
     struct timeval tv = {.tv_sec = 0, .tv_usec = 10000};
-    if (select(ctx.sock + 1, &rset, 0, 0, &tv) >= 9 &&
+    if (select(ctx.sock + 1, &rset, 0, 0, &tv) >= 0 &&
         FD_ISSET(ctx.sock, &rset)) {
       struct sockaddr_in sa;
       uint8_t buf[BUFSIZ];
       unsigned sl = sizeof(sa);
       int len =
           recvfrom(ctx.sock, buf, sizeof(buf), 0, (struct sockaddr *) &sa, &sl);
+      MG_INFO(("Got %d", len));
       if (len <= 0) fail("Socket closed\n");
       if (len > (int) mif.frame_max_size) continue;
       mif.frame_len = len;

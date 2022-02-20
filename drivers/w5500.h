@@ -48,6 +48,10 @@ static inline uint8_t w5500_r1(struct w5500 *w, uint8_t block, uint16_t addr) { 
 static inline uint16_t w5500_r2(struct w5500 *w, uint8_t block, uint16_t addr) { uint8_t buf[2] = {0, 0}; w5500_rn(w, block, addr, buf, sizeof(buf)); return (uint16_t) ((buf[0] << 8) | buf[1]); }
 // clang-format on
 
+static inline uint8_t w5500_status(struct w5500 *w) {
+  return w5500_r1(w, W5500_CR, 0x2e);
+}
+
 static inline uint16_t w5500_rx(struct w5500 *w, uint8_t *buf, uint16_t len) {
   uint16_t r = 0, n = 0, n2;                              // Read recv len
   while ((n2 = w5500_r2(w, W5500_S0, 0x26)) > n) n = n2;  // Until it is stable

@@ -13,7 +13,6 @@ static int s_signo;
 union {
   struct sockaddr sa;
   struct sockaddr_ll ll;
-  struct sockaddr_pkt pkt;
 } s_usa = {.ll = {.sll_family = PF_PACKET, .sll_pkttype = PACKET_HOST}};
 
 void signal_handler(int signo) {
@@ -33,16 +32,23 @@ static int faile(const char *name) {
 }
 
 static void tx(struct mip_if *ifp) {
-  int sock = *(int *) ifp->userdata;
+  int sock = *(int *) ifp->txdata;
   int n =
       sendto(sock, ifp->frame, ifp->frame_len, 0, &s_usa.sa, sizeof(s_usa.ll));
   printf("-> %d/%lu\n", n, ifp->frame_len);
 }
 
 static void fn(struct mg_connection *c, int ev, void *ev_data, void *fn_data) {
+  if (ev == MG_EV_POLL) return;
   MG_INFO(("%lu %d %p %p", c->id, ev, ev_data, fn_data));
-  if (ev == MG_EV_READ) {
+  if (ev == MG_EV_OPEN) {
+    c->is_hexdumping = 1;
   }
+}
+
+static void timer_fn(void *arg) {
+  struct mg_mgr *mgr = (struct mg_mgr *) arg;
+  mg_http_connect(mgr, "http://cesanta.com", fn, NULL);
 }
 
 int main(void) {
@@ -61,13 +67,17 @@ int main(void) {
 
   uint8_t frame[2048];
   struct mip_if mif = {.tx = tx,
-                       .userdata = &sock,
+                       .txdata = &sock,
                        .frame = frame,
                        .mac = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
                        .frame_max_size = sizeof(frame)};
 
   struct mg_mgr mgr;
+  struct mg_timer t;
   mg_mgr_init(&mgr);
+  mg_log_set("3");
+  mg_attach_mip(&mgr, &mif);
+  mg_timer_init(&t, 300, MG_TIMER_REPEAT, timer_fn, &mgr);
   mg_listen(&mgr, "udp://0.0.0.0:1234", fn, NULL);
 
   // Main loop. Listen for input from UART, PCAP, and STDIN.
@@ -92,6 +102,7 @@ int main(void) {
     }
     mip_poll(&mif, mg_millis());
   }
+
   close(sock);
   printf("Exiting on signal %d\n", s_signo);
   return 0;

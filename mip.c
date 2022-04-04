@@ -25,15 +25,17 @@
   if (0) printf x
 #endif
 
+#define _packed __attribute__((packed))
+
 struct lcp {
   uint8_t addr, ctrl, proto[2], code, id, len[2];
-} __attribute__((packed));
+} _packed;
 
 struct eth {
   uint8_t dst[6];  // Destination MAC address
   uint8_t src[6];  // Source MAC address
   uint16_t type;   // Ethernet type
-} __attribute__((packed));
+} _packed;
 
 struct ip {
   uint8_t ver;    // Version
@@ -46,13 +48,13 @@ struct ip {
   uint16_t csum;  // Checksum
   uint32_t src;   // Source IP
   uint32_t dst;   // Destination IP
-} __attribute__((packed));
+} _packed;
 
 struct icmp {
   uint8_t type;
   uint8_t code;
   uint16_t csum;
-} __attribute__((packed));
+} _packed;
 
 struct arp {
   uint16_t fmt;    // Format of hardware address
@@ -64,7 +66,7 @@ struct arp {
   uint32_t spa;    // Sender protocol address
   uint8_t tha[6];  // Target hardware address
   uint32_t tpa;    // Target protocol address
-} __attribute__((packed));
+} _packed;
 
 struct tcp {
   uint16_t sport;  // Source port
@@ -76,7 +78,7 @@ struct tcp {
   uint16_t win;    // Window
   uint16_t csum;   // Checksum
   uint16_t surp;   // Urgent pointer
-} __attribute__((packed));
+} _packed;
 #define TH_FIN 0x01
 #define TH_SYN 0x02
 #define TH_RST 0x04
@@ -92,7 +94,7 @@ struct udp {
   uint16_t dport;  // Destination port
   uint16_t len;    // UDP length
   uint16_t csum;   // UDP checksum
-} __attribute__((packed));
+} _packed;
 
 struct dhcp {
   uint8_t op, htype, hlen, hops;
@@ -102,11 +104,38 @@ struct dhcp {
   uint8_t hwaddr[208];
   uint32_t magic;
   uint8_t options[32];
-} __attribute__((packed));
+} _packed;
+
+struct str {
+  uint8_t *buf;
+  size_t len;
+};
+
+struct pkt {
+  struct str raw;  // Raw packet data
+  struct str pay;  // Payload data
+  struct eth *eth;
+  struct llc *llc;
+  struct arp *arp;
+  struct ip *ip;
+  struct icmp *icmp;
+  struct tcp *tcp;
+  struct udp *udp;
+  uint16_t src_port, dst_port;  // L4 ports
+};
 
 #define U16(ptr) ((((uint16_t) (ptr)[0]) << 8) | (ptr)[1])
 #define NET16(x) __builtin_bswap16(x)
 #define NET32(x) __builtin_bswap32(x)
+
+static struct str mkstr(void *buf, size_t len) {
+  struct str str = {buf, len};
+  return str;
+}
+
+static void mkpay(struct pkt *pkt, void *p) {
+  pkt->pay = mkstr(p, &pkt->raw.buf[pkt->raw.len] - (uint8_t *) p);
+}
 
 static uint32_t csumup(uint32_t sum, const void *buf, size_t len) {
   const uint8_t *p = (const uint8_t *) buf;
@@ -122,6 +151,20 @@ static uint16_t csumfin(uint32_t sum) {
 static uint16_t ipcsum(const void *buf, size_t len) {
   uint32_t sum = csumup(0, buf, len);
   return csumfin(sum);
+}
+
+static void mip_call(struct mip_if *ifp, uint8_t ev, struct pkt *pkt) {
+  if (ifp->ev != NULL) {
+    struct mip_ev mev = {.ifp = ifp,
+                         .event = ev,
+                         .src_ip = pkt->ip ? pkt->ip->src : 0,
+                         .dst_ip = pkt->ip ? pkt->ip->dst : 0,
+                         .src_port = pkt->src_port,
+                         .dst_port = pkt->dst_port,
+                         .buf = pkt->pay.buf,
+                         .len = pkt->pay.len};
+    ifp->ev(&mev);
+  }
 }
 
 // ARP cache is organised as a doubly linked list. A successful cache lookup
@@ -182,8 +225,8 @@ static struct ip *tx_ip(struct mip_if *ifp, uint8_t proto, uint32_t ip_src,
   return ip;
 }
 
-static void tx_udp(struct mip_if *ifp, uint32_t ip_src, uint32_t ip_dst,
-                   uint16_t sport, uint16_t dport, void *buf, size_t len) {
+void mip_tx_udp(struct mip_if *ifp, uint32_t ip_src, uint16_t sport,
+                uint32_t ip_dst, uint16_t dport, const void *buf, size_t len) {
   struct ip *ip = tx_ip(ifp, 17, ip_src, ip_dst, len + sizeof(struct udp));
   struct udp *udp = (struct udp *) (ip + 1);
   udp->sport = NET16(sport);
@@ -215,7 +258,7 @@ static void tx_dhcp(struct mip_if *ifp, uint32_t src, uint32_t dst,
   memcpy(dhcp->hwaddr, ifp->mac, sizeof(ifp->mac));
   memcpy(&dhcp->xid, ifp->mac + 2, sizeof(dhcp->xid));
   memcpy(dhcp->options, opts, optslen);
-  tx_udp(ifp, src, dst, 68, 67, dhcp, sizeof(*dhcp));
+  mip_tx_udp(ifp, src, 68, dst, 67, dhcp, sizeof(*dhcp));
 }
 
 static void tx_dhcp_request(struct mip_if *ifp, uint32_t src, uint32_t dst) {
@@ -229,7 +272,7 @@ static void tx_dhcp_request(struct mip_if *ifp, uint32_t src, uint32_t dst) {
   };
   memcpy(opts + 14, &dst, sizeof(dst));
   memcpy(opts + 20, &src, sizeof(src));
-  tx_dhcp(ifp, 0, 0xffffffff, opts, sizeof(opts));
+  tx_dhcp(ifp, src, dst, opts, sizeof(opts));
 }
 
 static void tx_dhcp_discover(struct mip_if *ifp) {
@@ -241,40 +284,40 @@ static void tx_dhcp_discover(struct mip_if *ifp) {
   tx_dhcp(ifp, 0, 0xffffffff, opts, sizeof(opts));
 }
 
-static void rx_arp(struct mip_if *ifp, struct eth *eth, struct arp *arp) {
+static void rx_arp(struct mip_if *ifp, struct pkt *pkt) {
   // DBG(("ARP op %d %#x %#x\n", NET16(arp->op), arp->spa, arp->tpa));
-  if (arp->op == NET16(1) && arp->tpa == ifp->ip) {
+  if (pkt->arp->op == NET16(1) && pkt->arp->tpa == ifp->ip) {
     // ARP request. Edit packet in-place. Make a response, then send
-    memcpy(eth->dst, eth->src, sizeof(eth->dst));
-    memcpy(eth->src, ifp->mac, sizeof(eth->src));
-    arp->op = NET16(2);
-    memcpy(arp->tha, arp->sha, sizeof(arp->tha));
-    memcpy(arp->sha, ifp->mac, sizeof(arp->sha));
-    arp->tpa = arp->spa;
-    arp->spa = ifp->ip;
+    memcpy(pkt->eth->dst, pkt->eth->src, sizeof(pkt->eth->dst));
+    memcpy(pkt->eth->src, ifp->mac, sizeof(pkt->eth->src));
+    pkt->arp->op = NET16(2);
+    memcpy(pkt->arp->tha, pkt->arp->sha, sizeof(pkt->arp->tha));
+    memcpy(pkt->arp->sha, ifp->mac, sizeof(pkt->arp->sha));
+    pkt->arp->tpa = pkt->arp->spa;
+    pkt->arp->spa = ifp->ip;
     DBG(("ARP response: we're %#lx\n", (long) ifp->ip));
-    ifp->frame_len = sizeof(*eth) + sizeof(*arp);
+    ifp->frame_len = sizeof(*pkt->eth) + sizeof(*pkt->arp);
     ifp->tx(ifp);
-  } else if (arp->op == NET16(2)) {
-    if (memcmp(arp->tha, ifp->mac, sizeof(arp->tha)) != 0) return;
-    arp_cache_add(ifp, arp->tpa, arp->tha);
+  } else if (pkt->arp->op == NET16(2)) {
+    if (memcmp(pkt->arp->tha, ifp->mac, sizeof(pkt->arp->tha)) != 0) return;
+    arp_cache_add(ifp, pkt->arp->tpa, pkt->arp->tha);
   }
 }
 
-static void rx_icmp(struct mip_if *ifp, struct eth *eth, struct ip *ip,
-                    struct icmp *icmp, size_t len) {
-  DBG(("ICMP %d\n", (int) len));
-  if (icmp->type == 8 && ip->dst == ifp->ip) {
-    memcpy(eth->dst, eth->src, sizeof(eth->dst));
-    memcpy(eth->src, ifp->mac, sizeof(eth->src));
-    ip->dst = ip->src;
-    ip->src = ifp->ip;
-    ip->csum = 0;  // Important - clear csum before recomputing
-    ip->csum = ipcsum(ip, sizeof(*ip));
-    icmp->type = 0;
-    icmp->csum = 0;  // Important - clear csum before recomputing
-    icmp->csum = ipcsum(icmp, sizeof(*icmp) + len);
-    ifp->frame_len = sizeof(*eth) + sizeof(*ip) + sizeof(*icmp) + len;
+static void rx_icmp(struct mip_if *ifp, struct pkt *pkt) {
+  // DBG(("ICMP %d\n", (int) len));
+  if (pkt->icmp->type == 8 && pkt->ip->dst == ifp->ip) {
+    mip_call(ifp, MIP_ICMP, pkt);
+    memcpy(pkt->eth->dst, pkt->eth->src, sizeof(pkt->eth->dst));
+    memcpy(pkt->eth->src, ifp->mac, sizeof(pkt->eth->src));
+    pkt->ip->dst = pkt->ip->src;
+    pkt->ip->src = ifp->ip;
+    pkt->ip->csum = 0;  // Important - clear csum before recomputing
+    pkt->ip->csum = ipcsum(pkt->ip, sizeof(*pkt->ip));
+    pkt->icmp->type = 0;
+    pkt->icmp->csum = 0;  // Important - clear csum before recomputing
+    pkt->icmp->csum = ipcsum(pkt->icmp, sizeof(*pkt->icmp) + pkt->pay.len);
+    // ifp->frame_len = sizeof(*eth) + sizeof(*ip) + sizeof(*icmp) + len;
     DBG(("ICMP response %d\n", (int) ifp->frame_len));
     ifp->tx(ifp);
   }
@@ -301,42 +344,46 @@ static void rx_dhcp(struct mip_if *ifp, struct dhcp *dhcp, size_t len) {
          (long) gw));
     arp_cache_add(ifp, dhcp->siaddr, ((struct eth *) ifp->frame)->src);
     ifp->ip = ip, ifp->gw = gw, ifp->mask = mask;
+    struct pkt dummy = {.raw = {0, 0}};
+    mip_call(ifp, MIP_UP, &dummy);
     tx_dhcp_request(ifp, ip, dhcp->siaddr);
   }
 }
 
-static void rx_ip(struct mip_if *ifp, struct eth *eth, struct ip *ip,
-                  size_t len) {
+static void rx_ip(struct mip_if *ifp, struct pkt *pkt) {
   // DBG(("IP %d\n", (int) len));
-  if (ip->proto == 1) {
-    struct icmp *icmp = (struct icmp *) (ip + 1);
-    if (len < sizeof(*icmp)) return;
-    rx_icmp(ifp, eth, ip, icmp, len - sizeof(*icmp));
-  } else if (ip->proto == 17) {
-    struct udp *udp = (struct udp *) (ip + 1);
-    if (len < sizeof(*udp)) return;
+  if (pkt->ip->proto == 1) {
+    pkt->icmp = (struct icmp *) (pkt->ip + 1);
+    if (pkt->pay.len < sizeof(*pkt->icmp)) return;
+    mkpay(pkt, pkt->icmp + 1);
+    rx_icmp(ifp, pkt);
+  } else if (pkt->ip->proto == 17) {
+    pkt->udp = (struct udp *) (pkt->ip + 1);
+    if (pkt->pay.len < sizeof(*pkt->udp)) return;
     // DBG(("  UDP %u %u -> %u\n", len, NET16(udp->sport), NET16(udp->dport)));
-    if (udp->dport == NET16(68))
-      rx_dhcp(ifp, (struct dhcp *) (udp + 1), len - sizeof(*udp));
+    mkpay(pkt, pkt->udp + 1);
+    if (pkt->udp->dport == NET16(68))
+      rx_dhcp(ifp, (struct dhcp *) (pkt->udp + 1), pkt->pay.len);
   }
 }
 
 void mip_rx(struct mip_if *ifp) {
   // DBG(("gt frame %u bytes\n", len));
-  size_t len = ifp->frame_len;
-  struct eth *eth = (struct eth *) ifp->frame;
-  if (len < sizeof(*eth)) return;  // Truncated packet - runt?
-  if (eth->type == NET16(0x806)) {
-    struct arp *arp = (struct arp *) (eth + 1);
-    if (sizeof(*eth) + sizeof(*arp) > len) return;  // Truncated
-    rx_arp(ifp, eth, arp);
-  } else if (eth->type == NET16(0x800)) {
-    struct ip *ip = (struct ip *) (eth + 1);
-    if (len < sizeof(*eth) + sizeof(*ip)) return;  // Truncated packed
-    if (ip->ver != 0x45) return;                   // Not IP
-    rx_ip(ifp, eth, ip, len - sizeof(*eth) - sizeof(*ip));
+  struct pkt pkt = {.raw = {.buf = ifp->frame, .len = ifp->frame_len}};
+  pkt.eth = (struct eth *) ifp->frame;
+  if (pkt.raw.len < sizeof(*pkt.eth)) return;  // Truncated - runt?
+  if (pkt.eth->type == NET16(0x806)) {
+    pkt.arp = (struct arp *) (pkt.eth + 1);
+    if (sizeof(*pkt.eth) + sizeof(*pkt.arp) > pkt.raw.len) return;  // Truncated
+    rx_arp(ifp, &pkt);
+  } else if (pkt.eth->type == NET16(0x800)) {
+    pkt.ip = (struct ip *) (pkt.eth + 1);
+    if (pkt.raw.len < sizeof(*pkt.eth) + sizeof(*pkt.ip)) return;  // Truncated
+    if (pkt.ip->ver != 0x45) return;                               // Not IP
+    mkpay(&pkt, pkt.ip + 1);
+    rx_ip(ifp, &pkt);
   } else {
-    DBG(("  Unknown eth type %x\n", NET16(eth->type)));
+    DBG(("  Unknown eth type %x\n", NET16(pkt.eth->type)));
   }
 }
 

@@ -28,11 +28,25 @@ extern "C" {
 #define MIP_ARP_ENTRIES 5  // Number of ARP cache entries. Maximum 21
 #endif
 
+// Events
+enum { MIP_DOWN, MIP_UP, MIP_POLL, MIP_IP, MIP_ICMP, MIP_UDP, MIP_TCP };
+struct mip_ev {
+  struct mip_if *ifp;           // Interface that got an event
+  uint8_t event;                // Event number - see above
+  uint8_t proto;                // Protocol: 1 ICMP, 6 TCP, 17 UDP
+  uint32_t src_ip, dst_ip;      // Source and destination IP
+  uint16_t src_port, dst_port;  // Source and dst ports
+  uint8_t *buf;                 // Payload
+  size_t len;                   // Payload length
+};
+
 // Network interface descriptor
 struct mip_if {
   // These settings must be initialised by the user
-  void *userdata;               // Custom data for this iface
-  void (*tx)(struct mip_if *);  // Transmit frame (set frame_len!)
+  void (*tx)(struct mip_if *);  // Transmit frame function
+  void *txdata;                 // Custom data for tx function
+  void (*ev)(struct mip_ev *);  // Event handler function
+  void *evdata;                 // Custom data for ev function
   uint8_t mac[6];               // MAC address
   uint32_t ip, mask, gw;        // Leave zeros to use DCHP
   uint8_t *frame;               // Frame (input and output)
@@ -46,6 +60,10 @@ struct mip_if {
 
 void mip_rx(struct mip_if *);                 // Receive frame (set frame_len!)
 void mip_poll(struct mip_if *, uint64_t ms);  // Call periodically
+
+void mip_tx_udp(struct mip_if *ifp, uint32_t src_ip, uint16_t src_port,
+                uint32_t dst_ip, uint16_t dst_port, const void *buf,
+                size_t len);
 
 #ifdef __cplusplus
 }

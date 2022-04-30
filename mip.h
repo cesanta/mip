@@ -21,6 +21,7 @@
 extern "C" {
 #endif
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -43,23 +44,26 @@ struct mip_ev {
 // Network interface descriptor
 struct mip_if {
   // These settings must be initialised by the user
-  void (*tx)(struct mip_if *);  // Transmit frame function
-  void *txdata;                 // Custom data for tx function
-  void (*ev)(struct mip_ev *);  // Event handler function
-  void *evdata;                 // Custom data for ev function
-  uint8_t mac[6];               // MAC address
-  uint32_t ip, mask, gw;        // Leave zeros to use DCHP
-  uint8_t *frame;               // Frame (input and output)
-  size_t frame_max_size;        // Frame max size
+  void (*tx)(void *buf, size_t len, void *);  // Transmit frame function
+  void *txdata;                               // Custom data for tx function
+  void (*ev)(struct mip_ev *);                // Event handler function
+  void *evdata;                               // Custom data for ev function
+  uint8_t mac[6];                             // MAC address
+  uint32_t ip, mask, gw;  // IP address, mask, default gateway
+  uint8_t *buf;           // Output frame buffer
+  size_t len;             // Output frame buffer size
+  bool use_dhcp;          // Enable DCHP
+  bool (*phy)(void);      // Returns physical iface up/down status
+  bool up;                // Current phy up/down status
 
   // These settings are used internally
-  size_t frame_len;                             // Frame length
   uint64_t timer;                               // Timer
   uint8_t arp_cache[2 + 12 * MIP_ARP_ENTRIES];  // Each entry is 12 bytes
+  uint16_t eport;                               // Next ephemeral port
 };
 
-void mip_rx(struct mip_if *);                 // Receive frame (set frame_len!)
-void mip_poll(struct mip_if *, uint64_t ms);  // Call periodically
+void mip_rx(struct mip_if *, void *, size_t);  // Receive frame
+void mip_poll(struct mip_if *, uint64_t ms);   // Call periodically
 
 void mip_tx_udp(struct mip_if *ifp, uint32_t src_ip, uint16_t src_port,
                 uint32_t dst_ip, uint16_t dst_port, const void *buf,

@@ -7,15 +7,14 @@ LIBS ?=
 ARGS ?=
 CFLAGS ?= $(WARN) $(OPTS) $(INCL) $(DEFS) 
 
-all: test cpp vlan
+all: test test++
 
 test:
 	$(CC) $(CFLAGS) unit_test.c -o /tmp/ut
 	$(RUN) /tmp/ut
 
-cpp:
-	$(CXX) $(CFLAGS) unit_test.c -o /tmp/ut
-	$(RUN) /tmp/ut
+test++: test
+test++: CC = g++
 
 vlan: vlan.c mongoose_custom.c ../mip.c $(MDIR)/mongoose.c
 	$(CC) $? $(CFLAGS) $(LIBS) -o /tmp/vlan

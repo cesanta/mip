@@ -1,7 +1,7 @@
 // Copyright (c) 2022 Cesanta Software Limited
 // All rights reserved
 
-#include "eth.h"
+#include "mip_driver_stm32.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,8 +30,9 @@ static uint32_t s_rxdesc[ETH_DESC_CNT][ETH_DS];      // RX descriptors
 static uint32_t s_txdesc[ETH_DESC_CNT][ETH_DS];      // TX descriptors
 static uint8_t s_rxbuf[ETH_DESC_CNT][ETH_PKT_SIZE];  // RX ethernet buffers
 static uint8_t s_txbuf[ETH_DESC_CNT][ETH_PKT_SIZE];  // TX ethernet buffers
-static void (*s_rx)(void *, void *, size_t);         // Recv callback
+static void (*s_rx)(void *, size_t, void *);         // Recv callback
 static void *s_rxdata;                               // Recv callback data
+static void *s_userdata;                             // Driver data
 static volatile uint32_t s_nirq, s_nrcv, s_nsnt;     // Counters
 enum { PHY_ADDR = 0, PHY_BCR = 0, PHY_BSR = 1 };     // PHY constants
 
@@ -55,9 +56,8 @@ void eth_write_phy(uint8_t addr, uint8_t reg, uint32_t val) {
   while (ETH->MACMIIAR & BIT(0)) spin(1);
 }
 
-void eth_driver_init(void *rxdata, void (*rx)(void *, void *, size_t)) {
-  s_rx = rx;
-  s_rxdata = rxdata;
+void mip_driver_stm32_init(void *userdata) {
+  s_userdata = userdata;
 
   // Init RX descriptors
   for (int i = 0; i < ETH_DESC_CNT; i++) {
@@ -92,7 +92,12 @@ void eth_driver_init(void *rxdata, void (*rx)(void *, void *, size_t)) {
   ETH->DMAOMR = BIT(1) | BIT(13) | BIT(21) | BIT(25);  // SR, ST, TSF, RSF
 }
 
-size_t eth_driver_transmit_frame(const void *buf, size_t len) {
+void mip_driver_stm32_setrx(void (*rx)(void *, size_t, void *), void *rxdata) {
+  s_rx = rx;
+  s_rxdata = rxdata;
+}
+
+size_t mip_driver_stm32_tx(const void *buf, size_t len, void *userdata) {
   uint32_t no = s_nsnt % ETH_DESC_CNT;  // Descriptor number
   if (len > sizeof(s_txbuf[0])) {
     len = 0;  // Frame is too big
@@ -107,11 +112,14 @@ size_t eth_driver_transmit_frame(const void *buf, size_t len) {
   }
   if (ETH->DMASR & BIT(2)) ETH->DMASR = BIT(2), ETH->DMATPDR = 0;  // Un-busy
   if (ETH->DMASR & BIT(5)) ETH->DMASR = BIT(5), ETH->DMATPDR = 0;  // Un-busy
+  printf("TX %d\n", (int) len);
   return len;
+  (void) userdata;
 }
 
-bool eth_driver_has_carrier(void) {
+bool mip_driver_stm32_status(void *userdata) {
   return eth_read_phy(PHY_ADDR, PHY_BSR) & BIT(2) ? 1 : 0;
+  (void) userdata;
 }
 
 void irq_eth(void) {  // Ethernet IRQ handler
@@ -121,7 +129,7 @@ void irq_eth(void) {  // Ethernet IRQ handler
     uint32_t no = s_nrcv % ETH_DESC_CNT;  // Descriptor number
     uint32_t len = ((s_rxdesc[no][0] >> 16) & (BIT(14) - 1));
     if (s_rxdesc[no][0] & BIT(31)) break;
-    if (s_rx != NULL) s_rx(s_rxdata, s_rxbuf[no], len > 4 ? len - 4 : len);
+    if (s_rx != NULL) s_rx(s_rxbuf[no], len > 4 ? len - 4 : len, s_rxdata);
     s_rxdesc[no][0] = BIT(31);
     s_nrcv++;
   }

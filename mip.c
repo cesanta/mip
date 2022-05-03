@@ -34,6 +34,7 @@ struct mip_if {
   struct mg_mgr *mgr;         // Mongoose event manager
 
   // Internal state, user can use it but should not change it
+  uint64_t curtime;                             // Last poll timestamp in millis
   uint64_t timer;                               // Timer
   uint8_t arp_cache[2 + 12 * MIP_ARP_ENTRIES];  // Each entry is 12 bytes
   uint16_t eport;                               // Next ephemeral port
@@ -203,7 +204,7 @@ static uint8_t *arp_cache_find(struct mip_if *ifp, uint32_t ip) {
     if (memcmp(p + j + 2, &ip, sizeof(ip)) == 0) {
       p[1] = j, p[0] = p[j];  // Found entry! Point list head to us
       // MG_DEBUG(("ARP find: %#lx @ %x:%x:%x:%x:%x:%x\n", (long) ip, p[j + 6],
-      //     p[j + 7], p[j + 8], p[j + 9], p[j + 10], p[j + 11]));
+      //          p[j + 7], p[j + 8], p[j + 9], p[j + 10], p[j + 11]));
       return p + j + 6;  // And return MAC address
     }
   }
@@ -221,11 +222,25 @@ static void arp_cache_add(struct mip_if *ifp, uint32_t ip, uint8_t mac[6]) {
   //      mac[1], mac[2], mac[3], mac[4], mac[5]));
 }
 
+static void arp_ask(struct mip_if *ifp, uint32_t ip) {
+  struct eth *eth = (struct eth *) ifp->buf;
+  struct arp *arp = (struct arp *) (eth + 1);
+  memset(eth->dst, 255, sizeof(eth->dst));
+  memcpy(eth->src, ifp->mac, sizeof(eth->src));
+  eth->type = NET16(0x806);
+  memset(arp, 0, sizeof(*arp));
+  arp->fmt = NET16(1), arp->pro = NET16(0x800), arp->hlen = 6, arp->plen = 4;
+  arp->op = NET16(1), arp->tpa = ip, arp->spa = ifp->ip;
+  memcpy(arp->sha, ifp->mac, sizeof(arp->sha));
+  ifp->driver->tx(eth, PDIFF(eth, arp + 1), ifp->driver->data);
+}
+
 static void onstatechange(struct mip_if *ifp) {
   if (ifp->state == MIP_STATE_READY) {
     char buf[40];
     struct mg_addr addr = {.ip = ifp->ip};
-    MG_INFO(("IP: %s", mg_ntoa(&addr, buf, sizeof(buf))));
+    MG_INFO(("READY, IP: %s", mg_ntoa(&addr, buf, sizeof(buf))));
+    arp_ask(ifp, ifp->gw);
   } else if (ifp->state == MIP_STATE_UP) {
     MG_ERROR(("Network up"));
   } else if (ifp->state == MIP_STATE_DOWN) {
@@ -329,11 +344,12 @@ static void rx_arp(struct mip_if *ifp, struct pkt *pkt) {
     memcpy(arp->sha, ifp->mac, sizeof(pkt->arp->sha));
     arp->tpa = pkt->arp->spa;
     arp->spa = ifp->ip;
-    MG_DEBUG(("ARP response: we're %#lx\n", (long) ifp->ip));
+    MG_DEBUG(("ARP response: we're %#lx", (long) ifp->ip));
     ifp->driver->tx(ifp->buf, sizeof(*eth) + sizeof(*arp), ifp->driver->data);
   } else if (pkt->arp->op == NET16(2)) {
     if (memcmp(pkt->arp->tha, ifp->mac, sizeof(pkt->arp->tha)) != 0) return;
-    // arp_cache_add(ifp, pkt->arp->tpa, pkt->arp->tha);
+    // MG_INFO(("ARP RESPONSE"));
+    arp_cache_add(ifp, pkt->arp->spa, pkt->arp->sha);
   }
 }
 
@@ -378,14 +394,21 @@ static void rx_dhcp(struct mip_if *ifp, struct pkt *pkt) {
   }
 }
 
-static void rx_udp(struct mip_if *ifp, struct pkt *pkt) {
+struct mg_connection *getpeer(struct mg_mgr *mgr, struct pkt *pkt, bool lsn) {
   struct mg_connection *c = NULL;
-  for (c = ifp->mgr->conns; c != NULL; c = c->next) {
-    if (c->is_udp && c->loc.port == pkt->udp->dport) break;
+  for (c = mgr->conns; c != NULL; c = c->next) {
+    if (c->is_udp && pkt->udp && c->loc.port == pkt->udp->dport) break;
+    if (!c->is_udp && pkt->tcp && c->loc.port == pkt->tcp->dport &&
+        lsn == c->is_listening)
+      break;
   }
+  return c;
+}
+
+static void rx_udp(struct mip_if *ifp, struct pkt *pkt) {
+  struct mg_connection *c = getpeer(ifp->mgr, pkt, true);
   if (c == NULL) {
-    // printf("NO UDP listener on port %hu\n", );
-    // MG_DEBUG(("%d %p %u", pkt->event, pkt->buf, pkt->len));
+    // No UDP listener on this port. Should send ICMP, but keep silent.
   } else if (c != NULL) {
     c->rem.port = pkt->udp->sport;
     c->rem.ip = pkt->ip->src;
@@ -403,16 +426,82 @@ static void rx_udp(struct mip_if *ifp, struct pkt *pkt) {
   }
 }
 
-static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
-  struct mg_connection *c = NULL;
-  for (c = ifp->mgr->conns; c != NULL; c = c->next) {
-    if (!c->is_udp && c->loc.port == pkt->tcp->dport) break;
+static uint32_t mksyncookie(uint32_t t, uint32_t mss, struct pkt *pkt) {
+  uint32_t hash = t ^ pkt->ip->src ^ pkt->ip->dst ^ pkt->tcp->sport;
+  return (t << 27) | ((mss & 7) << 24) | (hash & ((1UL << 24) - 1));
+}
+
+static void tx_tcp(struct mip_if *ifp, struct pkt *pkt, uint8_t flags,
+                   uint32_t seq, const void *buf, size_t len) {
+  struct ip *ip = tx_ip(ifp, 6, ifp->ip, pkt->ip->src, sizeof(struct tcp));
+  struct tcp *tcp = (struct tcp *) (ip + 1);
+  memset(tcp, 0, sizeof(*tcp));
+  memcpy(tcp + 1, buf, len);
+  tcp->sport = pkt->tcp->dport;
+  tcp->dport = pkt->tcp->sport;
+  tcp->seq = mg_htonl(seq);
+  tcp->ack = mg_htonl(mg_ntohl(pkt->tcp->seq) + 1);
+  tcp->flags = flags;
+  tcp->win = 0xffff;
+  tcp->off = (uint8_t) (sizeof(*tcp) / 4 << 4);
+  uint32_t cs = 0;
+  cs = csumup(cs, tcp, sizeof(*tcp) + len);
+  cs = csumup(cs, &ip->src, sizeof(ip->src));
+  cs = csumup(cs, &ip->dst, sizeof(ip->dst));
+  cs += ip->proto + sizeof(*tcp);
+  tcp->csum = csumfin(cs);
+  ifp->driver->tx(ifp->buf, PDIFF(ifp->buf, tcp + 1) + len, ifp->driver->data);
+}
+
+static struct mg_connection *accept_conn(struct mg_connection *lsn,
+                                         struct pkt *pkt) {
+  struct mg_connection *c = mg_alloc_conn(lsn->mgr);
+  char buf[40];
+  c->rem.ip = pkt->ip->src;
+  c->rem.port = pkt->tcp->sport;
+  mg_straddr(&c->rem, buf, sizeof(buf));
+  MG_DEBUG(("%lu accepted %s", c->id, buf));
+  LIST_ADD_HEAD(struct mg_connection, &lsn->mgr->conns, c);
+  c->fd = (void *) (size_t) mg_ntohl(pkt->tcp->ack);
+  c->is_accepted = 1;
+  c->is_hexdumping = lsn->is_hexdumping;
+  c->pfn = lsn->pfn;
+  c->loc = lsn->loc;
+  c->pfn_data = lsn->pfn_data;
+  c->fn = lsn->fn;
+  c->fn_data = lsn->fn_data;
+  mg_call(c, MG_EV_OPEN, NULL);
+  mg_call(c, MG_EV_ACCEPT, NULL);
+  return c;
+}
+
+static void read_conn(struct mg_connection *c, struct pkt *pkt) {
+  if (pkt->tcp->flags & TH_FIN) {
+    c->is_closing = 1;
+  } else if (pkt->pay.len == 0) {
+  } else if (c->recv.size - c->recv.len < pkt->pay.len &&
+             !mg_iobuf_resize(&c->recv, c->recv.len + pkt->pay.len)) {
+    mg_error(c, "oom");
+  } else {
+    memcpy(&c->recv.buf[c->recv.len], pkt->pay.buf, pkt->pay.len);
+    c->recv.len += pkt->pay.len;
+    struct mg_str evd = mg_str_n((char *) pkt->pay.buf, pkt->pay.len);
+    mg_call(c, MG_EV_READ, &evd);
   }
-  if (c == NULL) {
-    // printf("NO UDP listener on port %hu\n", );
-    // MG_DEBUG(("%d %p %u", pkt->event, pkt->buf, pkt->len));
-    // No listener on this port. Send RST
-  } else if (c != NULL) {
+}
+
+static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
+  struct mg_connection *c = getpeer(ifp->mgr, pkt, false);
+  if (c != NULL) {
+    read_conn(c, pkt);
+  } else if ((c = getpeer(ifp->mgr, pkt, true)) == NULL) {
+    tx_tcp(ifp, pkt, TH_RST | TH_ACK, 0, NULL, 0);  // No TCP listener. RST
+  } else if (pkt->tcp->flags & TH_SYN) {
+    // Create an initial sequence number, a syn cookie
+    uint32_t isn = mksyncookie((uint32_t) (ifp->curtime / 64000), 1, pkt);
+    tx_tcp(ifp, pkt, TH_SYN | TH_ACK, isn, NULL, 0);
+  } else {
+    accept_conn(c, pkt);
   }
 }
 
@@ -491,10 +580,15 @@ void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
 }
 
 void mip_poll(struct mip_if *ifp, uint64_t uptime_ms) {
+  ifp->curtime = uptime_ms;
   // Send DHCP If required
   if (ifp->ip == 0 && ifp->use_dhcp && uptime_ms > ifp->timer) {
     tx_dhcp_discover(ifp);
     ifp->timer = uptime_ms + 3000;
+  } else if (ifp->use_dhcp == false && uptime_ms > ifp->timer &&
+             arp_cache_find(ifp, ifp->gw) == NULL) {
+    arp_ask(ifp, ifp->gw);
+    ifp->timer = uptime_ms + 1000;
   }
 
   // Handle physical interface up/down status
@@ -517,11 +611,13 @@ static void on_rx(void *buf, size_t len, void *userdata) {
   // printf("RX %p %p %u\n", userdata, buf, (unsigned) len);
 }
 
-void mip_init(struct mg_mgr *mgr, uint8_t mac[6], struct mip_driver *driver) {
+void mip_init(struct mg_mgr *mgr, struct mip_ipcfg *ipcfg,
+              struct mip_driver *driver) {
   size_t maxpktsize = 1600;
   struct mip_if *ifp = (struct mip_if *) calloc(1, sizeof(*ifp) + maxpktsize);
-  memcpy(ifp->mac, mac, sizeof(ifp->mac));
-  ifp->use_dhcp = true;
+  memcpy(ifp->mac, ipcfg->mac, sizeof(ifp->mac));
+  ifp->use_dhcp = ipcfg->ip == 0;
+  ifp->ip = ipcfg->ip, ifp->mask = ipcfg->mask, ifp->gw = ipcfg->gw;
   ifp->buf = (uint8_t *) (ifp + 1);
   ifp->len = maxpktsize;
   ifp->driver = driver;

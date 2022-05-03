@@ -33,7 +33,12 @@ struct mip_driver {
   void (*rxcb)(void (*fn)(void *buf, size_t len, void *rxdata), void *rxdata);
 };
 
-void mip_init(struct mg_mgr *, uint8_t mac_address[6], struct mip_driver *);
+struct mip_ipcfg {
+  uint8_t mac[6];         // MAC address. Must not be 0
+  uint32_t ip, mask, gw;  // IP, netmask, GW. If IP is 0, DHCP is used
+};
+
+void mip_init(struct mg_mgr *, struct mip_ipcfg *, struct mip_driver *);
 
 #ifdef __cplusplus
 }

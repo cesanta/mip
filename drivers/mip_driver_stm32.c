@@ -112,13 +112,13 @@ size_t mip_driver_stm32_tx(const void *buf, size_t len, void *userdata) {
   }
   if (ETH->DMASR & BIT(2)) ETH->DMASR = BIT(2), ETH->DMATPDR = 0;  // Un-busy
   if (ETH->DMASR & BIT(5)) ETH->DMASR = BIT(5), ETH->DMATPDR = 0;  // Un-busy
-  printf("TX %d\n", (int) len);
   return len;
   (void) userdata;
 }
 
 bool mip_driver_stm32_status(void *userdata) {
-  return eth_read_phy(PHY_ADDR, PHY_BSR) & BIT(2) ? 1 : 0;
+  uint32_t bsr = eth_read_phy(PHY_ADDR, PHY_BSR);
+  return bsr & BIT(2) ? 1 : 0;
   (void) userdata;
 }
 

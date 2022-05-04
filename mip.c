@@ -15,20 +15,39 @@
 // license, please contact us at https://cesanta.com/contact.html
 
 #include "mip.h"
+#include <stdatomic.h>
 
 #define MIP_ETHEMERAL_PORT 49152
 #define _packed __attribute__((packed))
+#define U16(ptr) ((((uint16_t) (ptr)[0]) << 8) | (ptr)[1])
+#define NET16(x) __builtin_bswap16(x)
+#define NET32(x) __builtin_bswap32(x)
+#define PDIFF(a, b) ((size_t) (((char *) (b)) - ((char *) (a))))
 
 #ifndef MIP_ARP_ENTRIES
-#define MIP_ARP_ENTRIES 7  // Number of ARP cache entries. Maximum 21
+#define MIP_ARP_ENTRIES 5  // Number of ARP cache entries. Maximum 21
 #endif
+
+struct str {
+  uint8_t *buf;
+  size_t len;
+};
+
+// Receive queue - single producer, single consumer queue.  Interrupt-based
+// drivers copy received frames to the queue in interrupt context. mip_poll()
+// function runs in event loop context, reads from the queue
+struct queue {
+  uint8_t *buf;
+  size_t len;
+  volatile _Atomic size_t tail, head;
+};
 
 // Network interface
 struct mip_if {
   uint8_t mac[6];             // MAC address. Must be set to a valid MAC
   uint32_t ip, mask, gw;      // IP address, mask, default gateway. Can be 0
-  uint8_t *buf;               // Output frame buffer
-  size_t len;                 // Output frame buffer size
+  struct str rx;              // Output (TX) buffer
+  struct str tx;              // Input (RX) buffer
   bool use_dhcp;              // Enable DCHP
   struct mip_driver *driver;  // Low level driver
   struct mg_mgr *mgr;         // Mongoose event manager
@@ -42,6 +61,7 @@ struct mip_if {
 #define MIP_STATE_DOWN 0                        // Interface is down
 #define MIP_STATE_UP 1                          // Interface is up
 #define MIP_STATE_READY 2                       // Interface is up and has IP
+  struct queue queue;                           // Receive queue
 };
 
 struct lcp {
@@ -104,7 +124,7 @@ struct tcp {
   uint8_t flags;   // TCP flags
   uint16_t win;    // Window
   uint16_t csum;   // Checksum
-  uint16_t surp;   // Urgent pointer
+  uint16_t urp;    // Urgent pointer
 } _packed;
 #define TH_FIN 0x01
 #define TH_SYN 0x02
@@ -114,7 +134,6 @@ struct tcp {
 #define TH_URG 0x20
 #define TH_ECE 0x40
 #define TH_CWR 0x80
-#define TH_FLAGS (TH_FIN | TH_SYN | TH_RST | TH_ACK | TH_URG | TH_ECE | TH_CWR)
 
 struct udp {
   uint16_t sport;  // Source port
@@ -133,11 +152,6 @@ struct dhcp {
   uint8_t options[32];
 } _packed;
 
-struct str {
-  uint8_t *buf;
-  size_t len;
-};
-
 struct pkt {
   struct str raw;  // Raw packet data
   struct str pay;  // Payload data
@@ -152,10 +166,45 @@ struct pkt {
   struct dhcp *dhcp;
 };
 
-#define U16(ptr) ((((uint16_t) (ptr)[0]) << 8) | (ptr)[1])
-#define NET16(x) __builtin_bswap16(x)
-#define NET32(x) __builtin_bswap32(x)
-#define PDIFF(a, b) ((size_t) (((char *) (b)) - ((char *) (a))))
+static void q_copyin(struct queue *q, const uint8_t *buf, size_t len,
+                     size_t head) {
+  size_t i = 0, left = q->len - head;
+  for (; i < len && i < left; i++) q->buf[head + i] = buf[i];
+  for (; i < len; i++) q->buf[i - left] = buf[i];
+}
+
+static void q_copyout(struct queue *q, uint8_t *buf, size_t len, size_t tail) {
+  size_t i = 0, left = q->len - tail;
+  for (; i < len && i < left; i++) buf[i] = q->buf[tail + i];
+  for (; i < len; i++) buf[i] = q->buf[i - left];
+}
+
+static bool q_write(struct queue *q, const void *buf, size_t len) {
+  bool success = false;
+  size_t left = q->len - q->head + q->tail;
+  if (len + sizeof(size_t) <= left) {
+    q_copyin(q, (uint8_t *) &len, sizeof(len), q->head);
+    q_copyin(q, (uint8_t *) buf, len, (q->head + sizeof(size_t)) % q->len);
+    q->head = (q->head + sizeof(len) + len) % q->len;
+    success = true;
+  }
+  return success;
+}
+
+static size_t q_avail(struct queue *q) {
+  size_t n = 0;
+  if (q->tail != q->head) q_copyout(q, (uint8_t *) &n, sizeof(n), q->tail);
+  return n;
+}
+
+static size_t q_read(struct queue *q, void *buf) {
+  size_t n = q_avail(q);
+  if (n > 0) {
+    q_copyout(q, (uint8_t *) buf, n, (q->tail + sizeof(n)) % q->len);
+    q->tail = (q->tail + sizeof(n) + n) % q->len;
+  }
+  return n;
+}
 
 static struct str mkstr(void *buf, size_t len) {
   struct str str = {(uint8_t *) buf, len};
@@ -213,7 +262,7 @@ static uint8_t *arp_cache_find(struct mip_if *ifp, uint32_t ip) {
 
 static void arp_cache_add(struct mip_if *ifp, uint32_t ip, uint8_t mac[6]) {
   uint8_t *p = ifp->arp_cache;
-  if (ip == 0 || ip == ~0UL) return;            // Bad IP
+  if (ip == 0 || ip == ~0U) return;             // Bad IP
   if (arp_cache_find(ifp, ip) != NULL) return;  // Already exists, do nothing
   memcpy(p + p[0] + 2, &ip, sizeof(ip));  // Replace last entry: IP address
   memcpy(p + p[0] + 6, mac, 6);           // And MAC address
@@ -223,7 +272,7 @@ static void arp_cache_add(struct mip_if *ifp, uint32_t ip, uint8_t mac[6]) {
 }
 
 static void arp_ask(struct mip_if *ifp, uint32_t ip) {
-  struct eth *eth = (struct eth *) ifp->buf;
+  struct eth *eth = (struct eth *) ifp->tx.buf;
   struct arp *arp = (struct arp *) (eth + 1);
   memset(eth->dst, 255, sizeof(eth->dst));
   memcpy(eth->src, ifp->mac, sizeof(eth->src));
@@ -250,24 +299,22 @@ static void onstatechange(struct mip_if *ifp) {
 
 static struct ip *tx_ip(struct mip_if *ifp, uint8_t proto, uint32_t ip_src,
                         uint32_t ip_dst, size_t plen) {
-  struct eth *eth = (struct eth *) ifp->buf;
+  struct eth *eth = (struct eth *) ifp->tx.buf;
   struct ip *ip = (struct ip *) (eth + 1);
   uint8_t *mac = arp_cache_find(ifp, ip_dst);         // Dst IP in ARP cache ?
   if (!mac) mac = arp_cache_find(ifp, ifp->gw);       // No, use gateway
   if (mac) memcpy(eth->dst, mac, sizeof(eth->dst));   // Found? Use it
   if (!mac) memset(eth->dst, 255, sizeof(eth->dst));  // No? Use broadcast
-  memcpy(eth->src, ifp->mac, sizeof(eth->src));
+  memcpy(eth->src, ifp->mac, sizeof(eth->src));       // TODO(cpq): ARP lookup
   eth->type = NET16(0x800);
-  ip->ver = 0x45;
-  ip->tos = 0x0;
+  memset(ip, 0, sizeof(*ip));
+  ip->ver = 0x45;   // Version 4, header length 5 words
+  ip->frag = 0x40;  // Don't fragment
   ip->len = NET16((uint16_t) (sizeof(*ip) + plen));
-  ip->id = 0;
-  ip->frag = 0;
-  ip->ttl = 255;
+  ip->ttl = 64;
   ip->proto = proto;
   ip->src = ip_src;
   ip->dst = ip_dst;
-  ip->csum = 0;
   ip->csum = ipcsum(ip, sizeof(*ip));
   return ip;
 }
@@ -288,7 +335,7 @@ void tx_udp(struct mip_if *ifp, uint32_t ip_src, uint16_t sport,
   udp->csum = csumfin(cs);
   memmove(udp + 1, buf, len);
   // MG_DEBUG(("UDP LEN %d %d\n", (int) len, (int) ifp->frame_len));
-  ifp->driver->tx(ifp->buf,
+  ifp->driver->tx(ifp->tx.buf,
                   sizeof(struct eth) + sizeof(*ip) + sizeof(*udp) + len,
                   ifp->driver->data);
 }
@@ -333,7 +380,7 @@ static void rx_arp(struct mip_if *ifp, struct pkt *pkt) {
   // MG_DEBUG(("ARP op %d %#x %#x\n", NET16(arp->op), arp->spa, arp->tpa));
   if (pkt->arp->op == NET16(1) && pkt->arp->tpa == ifp->ip) {
     // ARP request. Make a response, then send
-    struct eth *eth = (struct eth *) ifp->buf;
+    struct eth *eth = (struct eth *) ifp->tx.buf;
     struct arp *arp = (struct arp *) (eth + 1);
     memcpy(eth->dst, pkt->eth->src, sizeof(eth->dst));
     memcpy(eth->src, ifp->mac, sizeof(eth->src));
@@ -345,7 +392,7 @@ static void rx_arp(struct mip_if *ifp, struct pkt *pkt) {
     arp->tpa = pkt->arp->spa;
     arp->spa = ifp->ip;
     MG_DEBUG(("ARP response: we're %#lx", (long) ifp->ip));
-    ifp->driver->tx(ifp->buf, sizeof(*eth) + sizeof(*arp), ifp->driver->data);
+    ifp->driver->tx(ifp->tx.buf, PDIFF(eth, arp + 1), ifp->driver->data);
   } else if (pkt->arp->op == NET16(2)) {
     if (memcmp(pkt->arp->tha, ifp->mac, sizeof(pkt->arp->tha)) != 0) return;
     // MG_INFO(("ARP RESPONSE"));
@@ -362,7 +409,7 @@ static void rx_icmp(struct mip_if *ifp, struct pkt *pkt) {
     memset(icmp, 0, sizeof(*icmp));  // Important - set csum to 0
     memcpy(icmp + 1, pkt->pay.buf, pkt->pay.len);
     icmp->csum = ipcsum(icmp, sizeof(*icmp) + pkt->pay.len);
-    ifp->driver->tx(ifp->buf, PDIFF(ifp->buf, icmp + 1) + pkt->pay.len,
+    ifp->driver->tx(ifp->tx.buf, PDIFF(ifp->tx.buf, icmp + 1) + pkt->pay.len,
                     ifp->driver->data);
   }
 }
@@ -427,36 +474,54 @@ static void rx_udp(struct mip_if *ifp, struct pkt *pkt) {
 }
 
 static uint32_t mksyncookie(uint32_t t, uint32_t mss, struct pkt *pkt) {
-  uint32_t hash = t ^ pkt->ip->src ^ pkt->ip->dst ^ pkt->tcp->sport;
+  uint32_t hash =
+      t ^ pkt->ip->src ^ pkt->ip->dst ^ pkt->tcp->sport ^ pkt->tcp->dport;
   return (t << 27) | ((mss & 7) << 24) | (hash & ((1UL << 24) - 1));
 }
 
-static void tx_tcp(struct mip_if *ifp, struct pkt *pkt, uint8_t flags,
-                   uint32_t seq, const void *buf, size_t len) {
-  struct ip *ip = tx_ip(ifp, 6, ifp->ip, pkt->ip->src, sizeof(struct tcp));
+struct tcpstate {
+  uint32_t seq, ack;
+};
+
+static size_t tx_tcp(struct mip_if *ifp, uint32_t dst_ip, uint8_t flags,
+                     uint16_t sport, uint16_t dport, uint32_t seq, uint32_t ack,
+                     const void *buf, size_t len) {
+  struct ip *ip = tx_ip(ifp, 6, ifp->ip, dst_ip, sizeof(struct tcp) + len);
   struct tcp *tcp = (struct tcp *) (ip + 1);
   memset(tcp, 0, sizeof(*tcp));
-  memcpy(tcp + 1, buf, len);
-  tcp->sport = pkt->tcp->dport;
-  tcp->dport = pkt->tcp->sport;
-  tcp->seq = mg_htonl(seq);
-  tcp->ack = mg_htonl(mg_ntohl(pkt->tcp->seq) + 1);
+  memmove(tcp + 1, buf, len);
+  tcp->sport = sport;
+  tcp->dport = dport;
+  tcp->seq = seq;
+  tcp->ack = ack;
   tcp->flags = flags;
-  tcp->win = 0xffff;
+  tcp->win = mg_htons(8192);
   tcp->off = (uint8_t) (sizeof(*tcp) / 4 << 4);
   uint32_t cs = 0;
-  cs = csumup(cs, tcp, sizeof(*tcp) + len);
+  uint16_t n = (uint16_t) (sizeof(*tcp) + len);
+  uint8_t pseudo[] = {0, ip->proto, (uint8_t) (n >> 8), (uint8_t) (n & 255)};
+  cs = csumup(cs, tcp, n);
   cs = csumup(cs, &ip->src, sizeof(ip->src));
   cs = csumup(cs, &ip->dst, sizeof(ip->dst));
-  cs += ip->proto + sizeof(*tcp);
+  cs = csumup(cs, pseudo, sizeof(pseudo));
   tcp->csum = csumfin(cs);
-  ifp->driver->tx(ifp->buf, PDIFF(ifp->buf, tcp + 1) + len, ifp->driver->data);
+  return ifp->driver->tx(ifp->tx.buf, PDIFF(ifp->tx.buf, tcp + 1) + len,
+                         ifp->driver->data);
+}
+
+static size_t tx_tcp_pkt(struct mip_if *ifp, struct pkt *pkt, uint8_t flags,
+                         uint32_t seq, const void *buf, size_t len) {
+  uint32_t delta = (pkt->tcp->flags & (TH_SYN | TH_FIN)) ? 1 : 0;
+  return tx_tcp(ifp, pkt->ip->src, flags, pkt->tcp->dport, pkt->tcp->sport, seq,
+                mg_htonl(mg_ntohl(pkt->tcp->seq) + delta), buf, len);
 }
 
 static struct mg_connection *accept_conn(struct mg_connection *lsn,
                                          struct pkt *pkt) {
   struct mg_connection *c = mg_alloc_conn(lsn->mgr);
+  struct tcpstate *s = (struct tcpstate *) (c + 1);
   char buf[40];
+  s->seq = mg_ntohl(pkt->tcp->ack), s->ack = mg_ntohl(pkt->tcp->seq);
   c->rem.ip = pkt->ip->src;
   c->rem.port = pkt->tcp->sport;
   mg_straddr(&c->rem, buf, sizeof(buf));
@@ -476,17 +541,27 @@ static struct mg_connection *accept_conn(struct mg_connection *lsn,
 }
 
 static void read_conn(struct mg_connection *c, struct pkt *pkt) {
+  struct mip_if *ifp = (struct mip_if *) c->mgr->priv;
+  struct tcpstate *s = (struct tcpstate *) (c + 1);
   if (pkt->tcp->flags & TH_FIN) {
+    // s->ack = mg_htonl(pkt->tcp->seq) + 1;
+    tx_tcp_pkt(ifp, pkt, TH_FIN | TH_ACK, pkt->tcp->ack, NULL, 0);
     c->is_closing = 1;
   } else if (pkt->pay.len == 0) {
   } else if (c->recv.size - c->recv.len < pkt->pay.len &&
              !mg_iobuf_resize(&c->recv, c->recv.len + pkt->pay.len)) {
     mg_error(c, "oom");
   } else {
+    s->ack = mg_htonl(pkt->tcp->seq) + pkt->pay.len;
     memcpy(&c->recv.buf[c->recv.len], pkt->pay.buf, pkt->pay.len);
     c->recv.len += pkt->pay.len;
     struct mg_str evd = mg_str_n((char *) pkt->pay.buf, pkt->pay.len);
     mg_call(c, MG_EV_READ, &evd);
+#if 0
+    // Send ACK immediately
+    tx_tcp(ifp, c->rem.ip, TH_ACK, c->loc.port, c->rem.port, mg_htonl(s->seq),
+           mg_htonl(s->ack), NULL, 0);
+#endif
   }
 }
 
@@ -495,18 +570,21 @@ static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
   if (c != NULL) {
     read_conn(c, pkt);
   } else if ((c = getpeer(ifp->mgr, pkt, true)) == NULL) {
-    tx_tcp(ifp, pkt, TH_RST | TH_ACK, 0, NULL, 0);  // No TCP listener. RST
+    tx_tcp_pkt(ifp, pkt, TH_RST | TH_ACK, pkt->tcp->ack, NULL, 0);
   } else if (pkt->tcp->flags & TH_SYN) {
     // Create an initial sequence number, a syn cookie
     uint32_t isn = mksyncookie((uint32_t) (ifp->curtime / 64000), 1, pkt);
-    tx_tcp(ifp, pkt, TH_SYN | TH_ACK, isn, NULL, 0);
+    tx_tcp_pkt(ifp, pkt, TH_SYN | TH_ACK, isn, NULL, 0);
+  } else if (pkt->tcp->flags & TH_FIN) {
+    // tx_tcp(ifp, pkt, TH_FIN | TH_ACK, mg_htonl(pkt->tcp->ack) + 1, NULL, 0);
+    tx_tcp_pkt(ifp, pkt, TH_FIN | TH_ACK, pkt->tcp->ack, NULL, 0);
   } else {
     accept_conn(c, pkt);
   }
 }
 
 static void rx_ip(struct mip_if *ifp, struct pkt *pkt) {
-  // MG_DEBUG(("IP %d\n", (int) len));
+  // MG_DEBUG(("IP %d", (int) pkt->pay.len));
   if (pkt->ip->proto == 1) {
     pkt->icmp = (struct icmp *) (pkt->ip + 1);
     if (pkt->pay.len < sizeof(*pkt->icmp)) return;
@@ -549,8 +627,7 @@ static void rx_ip6(struct mip_if *ifp, struct pkt *pkt) {
   }
 }
 
-void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
-  // MG_DEBUG(("gt frame %u bytes\n", len));
+static void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
   const uint8_t broadcast[] = {255, 255, 255, 255, 255, 255};
   struct pkt pkt = {.raw = {.buf = (uint8_t *) buf, .len = len}};
   pkt.eth = (struct eth *) buf;
@@ -579,16 +656,16 @@ void mip_rx(struct mip_if *ifp, void *buf, size_t len) {
   }
 }
 
-void mip_poll(struct mip_if *ifp, uint64_t uptime_ms) {
+static void mip_poll(struct mip_if *ifp, uint64_t uptime_ms) {
   ifp->curtime = uptime_ms;
-  // Send DHCP If required
-  if (ifp->ip == 0 && ifp->use_dhcp && uptime_ms > ifp->timer) {
-    tx_dhcp_discover(ifp);
-    ifp->timer = uptime_ms + 3000;
+
+  if (ifp->ip == 0 && uptime_ms > ifp->timer) {
+    tx_dhcp_discover(ifp);          // If IP not configured, send DHCP
+    ifp->timer = uptime_ms + 1000;  // with some interval
   } else if (ifp->use_dhcp == false && uptime_ms > ifp->timer &&
              arp_cache_find(ifp, ifp->gw) == NULL) {
-    arp_ask(ifp, ifp->gw);
-    ifp->timer = uptime_ms + 1000;
+    arp_ask(ifp, ifp->gw);          // If GW's MAC address in not in ARP cache
+    ifp->timer = uptime_ms + 1000;  // send ARP who-has request
   }
 
   // Handle physical interface up/down status
@@ -603,28 +680,43 @@ void mip_poll(struct mip_if *ifp, uint64_t uptime_ms) {
       onstatechange(ifp);
     }
   }
+
+  // Read data from the network
+  for (;;) {
+    size_t len = ifp->queue.len > 0 ? q_read(&ifp->queue, ifp->rx.buf)
+                                    : ifp->driver->rx(ifp->rx.buf, ifp->rx.len,
+                                                      ifp->driver->data);
+    if (len == 0) break;
+    mip_rx(ifp, ifp->rx.buf, len);
+  }
 }
 
+// This function executes in interrupt context, thus it should copy data
+// somewhere fast. Note that newlib's malloc is not thread safe, thus use
+// our lock-free queue with preallocated buffer to copy data and return asap
 static void on_rx(void *buf, size_t len, void *userdata) {
   struct mip_if *ifp = (struct mip_if *) userdata;
-  mip_rx(ifp, buf, len);
-  // printf("RX %p %p %u\n", userdata, buf, (unsigned) len);
+  if (!q_write(&ifp->queue, buf, len)) MG_ERROR(("dropped %d", (int) len));
 }
 
 void mip_init(struct mg_mgr *mgr, struct mip_ipcfg *ipcfg,
               struct mip_driver *driver) {
-  size_t maxpktsize = 1600;
-  struct mip_if *ifp = (struct mip_if *) calloc(1, sizeof(*ifp) + maxpktsize);
+  size_t maxpktsize = 1600, qlen = driver->rxcb ? 1024 * 16 : 0;
+  struct mip_if *ifp =
+      (struct mip_if *) calloc(1, sizeof(*ifp) + 2 * maxpktsize + qlen);
   memcpy(ifp->mac, ipcfg->mac, sizeof(ifp->mac));
   ifp->use_dhcp = ipcfg->ip == 0;
   ifp->ip = ipcfg->ip, ifp->mask = ipcfg->mask, ifp->gw = ipcfg->gw;
-  ifp->buf = (uint8_t *) (ifp + 1);
-  ifp->len = maxpktsize;
+  ifp->rx.buf = (uint8_t *) (ifp + 1), ifp->rx.len = maxpktsize;
+  ifp->tx.buf = ifp->rx.buf + maxpktsize, ifp->tx.len = maxpktsize;
   ifp->driver = driver;
   ifp->mgr = mgr;
+  ifp->queue.buf = ifp->tx.buf + maxpktsize;
+  ifp->queue.len = qlen;
   if (driver->init) driver->init(driver->data);
   if (driver->rxcb) driver->rxcb(on_rx, ifp);
   mgr->priv = ifp;
+  mgr->extraconnsize = sizeof(struct tcpstate);
 }
 
 void mg_connect_resolved(struct mg_connection *c) {
@@ -647,6 +739,19 @@ bool mg_open_listener(struct mg_connection *c, const char *url) {
   return true;
 }
 
+static void write_conn(struct mg_connection *c) {
+  struct mip_if *ifp = (struct mip_if *) c->mgr->priv;
+  struct tcpstate *s = (struct tcpstate *) (c + 1);
+  size_t n = c->send.len;
+  if (n + 100 > ifp->tx.len) n = ifp->tx.len - 100;
+  n = tx_tcp(ifp, c->rem.ip, TH_PUSH | TH_ACK, c->loc.port, c->rem.port,
+             mg_htonl(s->seq), mg_htonl(s->ack), c->send.buf, n);
+  if (n > 0) {
+    mg_iobuf_del(&c->send, 0, n);
+    s->seq += n;
+  }
+}
+
 void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
   struct mg_connection *c, *tmp;
   uint64_t now = mg_millis();
@@ -654,21 +759,7 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
   mg_timer_poll(&mgr->timers, now);
   for (c = mgr->conns; c != NULL; c = tmp) {
     tmp = c->next;
-#if 0
-    if (c->is_resolving || c->is_closing) {
-      // Do nothing
-    } else if (c->is_listening && c->is_udp == 0) {
-      if (c->is_readable) accept_conn(mgr, c);
-    } else if (c->is_connecting) {
-      if (c->is_readable || c->is_writable) connect_conn(c);
-    } else if (c->is_tls_hs) {
-      if ((c->is_readable || c->is_writable)) mg_tls_handshake(c);
-    } else {
-      if (c->is_readable) read_conn(c);
-      if (c->is_writable) write_conn(c);
-      while (c->is_tls && read_conn(c) > 0) (void) 0;  // Read buffered TLS data
-    }
-#endif
+    if (c->send.len > 0) write_conn(c);
     if (c->is_draining && c->send.len == 0) c->is_closing = 1;
     if (c->is_closing) mg_close_conn(c);
   }
@@ -684,7 +775,8 @@ bool mg_send(struct mg_connection *c, const void *buf, size_t len) {
     tx_udp(ifp, ifp->ip, c->loc.port, c->rem.ip, c->rem.port, buf, len);
     res = true;
   } else {
-    mg_error(c, "TCP Not implemented");
+    // tx_tdp(ifp, ifp->ip, c->loc.port, c->rem.ip, c->rem.port, buf, len);
+    return mg_iobuf_add(&c->send, c->send.len, buf, len, MG_IO_SIZE);
   }
   return res;
 }

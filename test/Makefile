@@ -10,7 +10,7 @@ CFLAGS ?= $(WARN) $(OPTS) $(INCL) $(DEFS)
 all: test test++
 
 test:
-	$(CC) $(CFLAGS) unit_test.c -o /tmp/ut
+	$(CC) $(CFLAGS) unit_test.c $(MDIR)/mongoose.c -I$(MDIR) -pthread -o /tmp/ut
 	$(RUN) /tmp/ut
 
 test++: test

@@ -24,11 +24,11 @@ extern "C" {
 #endif
 
 struct mip_driver {
-  void *data;                                      // Driver-specific data
-  void (*init)(void *data);                        // Initialise driver
-  size_t (*tx)(const void *, size_t, void *data);  // Transmit frame
-  void (*rx)(void *buf, size_t len, void *data);   // Receive frame (polling)
-  bool (*status)(void *data);                      // Up/down status
+  void *data;                                       // Driver-specific data
+  void (*init)(void *data);                         // Initialise driver
+  size_t (*tx)(const void *, size_t, void *data);   // Transmit frame
+  size_t (*rx)(void *buf, size_t len, void *data);  // Receive frame (polling)
+  bool (*status)(void *data);                       // Up/down status
   // Set receive callback for interrupt-driven drivers
   void (*rxcb)(void (*fn)(void *buf, size_t len, void *rxdata), void *rxdata);
 };

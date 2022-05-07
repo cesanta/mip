@@ -110,8 +110,10 @@ size_t mip_driver_stm32_tx(const void *buf, size_t len, void *userdata) {
     s_txdesc[no][0] |= BIT(31);  // Set OWN bit - let DMA take over
     s_nsnt++;
   }
-  if (ETH->DMASR & BIT(2)) ETH->DMASR = BIT(2), ETH->DMATPDR = 0;  // Un-busy
-  if (ETH->DMASR & BIT(5)) ETH->DMASR = BIT(5), ETH->DMATPDR = 0;  // Un-busy
+  uint32_t sr = ETH->DMASR;
+  if (sr & BIT(2)) ETH->DMASR = BIT(2), ETH->DMATPDR = 0;  // Un-busy
+  if (sr & BIT(5)) ETH->DMASR = BIT(5), ETH->DMATPDR = 0;  // Un-busy
+  if (len == 0) printf("E: D0 %lx, DMASR %lx\n", s_txdesc[0][0], sr);
   return len;
   (void) userdata;
 }
@@ -122,7 +124,7 @@ bool mip_driver_stm32_status(void *userdata) {
   (void) userdata;
 }
 
-void irq_eth(void) {  // Ethernet IRQ handler
+void ETH_IRQHandler(void) {
   volatile uint32_t sr = ETH->DMASR;
   s_nirq++;
   while (sr & BIT(6)) {                   // Frame received, loop
@@ -135,7 +137,7 @@ void irq_eth(void) {  // Ethernet IRQ handler
   }
   // printf("  %lx %lx %lx %lx %lx\n", s_nirq, s_nrcv, s_nsnt, sr,
   //       s_txdesc[s_nsnt % ETH_DESC_CNT][0]);
-  ETH->DMASR = ~0UL;                                     // Clear status
   if ((sr & BIT(2)) || (sr & BIT(5))) ETH->DMATPDR = 0;  // Resume TX
   if (sr & BIT(7)) ETH->DMARPDR = 0;                     // Resume RX
+  ETH->DMASR = sr & ~(BIT(2) | BIT(7));                  // Clear status
 }

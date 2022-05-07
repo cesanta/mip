@@ -27,6 +27,7 @@
 #ifndef MIP_ARP_ENTRIES
 #define MIP_ARP_ENTRIES 5  // Number of ARP cache entries. Maximum 21
 #endif
+#define MIP_ARP_CS (2 + 12 * MIP_ARP_ENTRIES)  // ARP cache size
 
 struct str {
   uint8_t *buf;
@@ -53,15 +54,15 @@ struct mip_if {
   struct mg_mgr *mgr;         // Mongoose event manager
 
   // Internal state, user can use it but should not change it
-  uint64_t curtime;                             // Last poll timestamp in millis
-  uint64_t timer;                               // Timer
-  uint8_t arp_cache[2 + 12 * MIP_ARP_ENTRIES];  // Each entry is 12 bytes
-  uint16_t eport;                               // Next ephemeral port
-  int state;                                    // Current state
-#define MIP_STATE_DOWN 0                        // Interface is down
-#define MIP_STATE_UP 1                          // Interface is up
-#define MIP_STATE_READY 2                       // Interface is up and has IP
-  struct queue queue;                           // Receive queue
+  uint64_t curtime;               // Last poll timestamp in millis
+  uint64_t timer;                 // Timer
+  uint8_t arp_cache[MIP_ARP_CS];  // Each entry is 12 bytes
+  uint16_t eport;                 // Next ephemeral port
+  int state;                      // Current state
+#define MIP_STATE_DOWN 0          // Interface is down
+#define MIP_STATE_UP 1            // Interface is up
+#define MIP_STATE_READY 2         // Interface is up and has IP
+  struct queue queue;             // Receive queue
 };
 
 struct lcp {
@@ -473,14 +474,9 @@ static void rx_udp(struct mip_if *ifp, struct pkt *pkt) {
   }
 }
 
-static uint32_t mksyncookie(uint32_t t, uint32_t mss, struct pkt *pkt) {
-  uint32_t hash =
-      t ^ pkt->ip->src ^ pkt->ip->dst ^ pkt->tcp->sport ^ pkt->tcp->dport;
-  return (t << 27) | ((mss & 7) << 24) | (hash & ((1UL << 24) - 1));
-}
-
 struct tcpstate {
   uint32_t seq, ack;
+  time_t expire;
 };
 
 static size_t tx_tcp(struct mip_if *ifp, uint32_t dst_ip, uint8_t flags,
@@ -520,12 +516,10 @@ static struct mg_connection *accept_conn(struct mg_connection *lsn,
                                          struct pkt *pkt) {
   struct mg_connection *c = mg_alloc_conn(lsn->mgr);
   struct tcpstate *s = (struct tcpstate *) (c + 1);
-  char buf[40];
   s->seq = mg_ntohl(pkt->tcp->ack), s->ack = mg_ntohl(pkt->tcp->seq);
   c->rem.ip = pkt->ip->src;
   c->rem.port = pkt->tcp->sport;
-  mg_straddr(&c->rem, buf, sizeof(buf));
-  MG_DEBUG(("%lu accepted %s", c->id, buf));
+  MG_DEBUG(("%lu accepted %lx:%hx", c->id, c->rem.ip, c->rem.port));
   LIST_ADD_HEAD(struct mg_connection, &lsn->mgr->conns, c);
   c->fd = (void *) (size_t) mg_ntohl(pkt->tcp->ack);
   c->is_accepted = 1;
@@ -541,16 +535,16 @@ static struct mg_connection *accept_conn(struct mg_connection *lsn,
 }
 
 static void read_conn(struct mg_connection *c, struct pkt *pkt) {
-  struct mip_if *ifp = (struct mip_if *) c->mgr->priv;
   struct tcpstate *s = (struct tcpstate *) (c + 1);
   if (pkt->tcp->flags & TH_FIN) {
-    // s->ack = mg_htonl(pkt->tcp->seq) + 1;
-    tx_tcp_pkt(ifp, pkt, TH_FIN | TH_ACK, pkt->tcp->ack, NULL, 0);
+    s->ack = mg_htonl(pkt->tcp->seq) + 1, s->seq = mg_htonl(pkt->tcp->ack);
     c->is_closing = 1;
   } else if (pkt->pay.len == 0) {
   } else if (c->recv.size - c->recv.len < pkt->pay.len &&
              !mg_iobuf_resize(&c->recv, c->recv.len + pkt->pay.len)) {
     mg_error(c, "oom");
+  } else if (mg_ntohl(pkt->tcp->seq) != s->ack) {
+    mg_error(c, "oob: %x %x", mg_ntohl(pkt->tcp->seq), s->ack);
   } else {
     s->ack = mg_htonl(pkt->tcp->seq) + pkt->pay.len;
     memcpy(&c->recv.buf[c->recv.len], pkt->pay.buf, pkt->pay.len);
@@ -568,18 +562,21 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
 static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
   struct mg_connection *c = getpeer(ifp->mgr, pkt, false);
   if (c != NULL) {
+    // MG_DEBUG(("%lu %d %lx:%hx -> %lx:%hx", c->id, (int) pkt->raw.len,
+    //         pkt->ip->src, pkt->tcp->sport, pkt->ip->dst, pkt->tcp->dport));
+    // hexdump(pkt->pay.buf, pkt->pay.len);
     read_conn(c, pkt);
   } else if ((c = getpeer(ifp->mgr, pkt, true)) == NULL) {
     tx_tcp_pkt(ifp, pkt, TH_RST | TH_ACK, pkt->tcp->ack, NULL, 0);
   } else if (pkt->tcp->flags & TH_SYN) {
-    // Create an initial sequence number, a syn cookie
-    uint32_t isn = mksyncookie((uint32_t) (ifp->curtime / 64000), 1, pkt);
-    tx_tcp_pkt(ifp, pkt, TH_SYN | TH_ACK, isn, NULL, 0);
+    // Use peer's source port as ISN, in order to recognise the handshake
+    tx_tcp_pkt(ifp, pkt, TH_SYN | TH_ACK, pkt->tcp->sport, NULL, 0);
   } else if (pkt->tcp->flags & TH_FIN) {
-    // tx_tcp(ifp, pkt, TH_FIN | TH_ACK, mg_htonl(pkt->tcp->ack) + 1, NULL, 0);
     tx_tcp_pkt(ifp, pkt, TH_FIN | TH_ACK, pkt->tcp->ack, NULL, 0);
-  } else {
+  } else if (pkt->tcp->ack == (0x1000000UL | pkt->tcp->sport)) {
     accept_conn(c, pkt);
+  } else {
+    // Silently drop
   }
 }
 
@@ -607,6 +604,9 @@ static void rx_ip(struct mip_if *ifp, struct pkt *pkt) {
     pkt->tcp = (struct tcp *) (pkt->ip + 1);
     if (pkt->pay.len < sizeof(*pkt->tcp)) return;
     mkpay(pkt, pkt->tcp + 1);
+    uint16_t iplen = mg_ntohs(pkt->ip->len);
+    uint16_t off = (uint16_t) (sizeof(*pkt->ip) + ((pkt->tcp->off >> 4) * 4U));
+    if (iplen >= off) pkt->pay.len = (size_t) (iplen - off);
     rx_tcp(ifp, pkt);
   }
 }
@@ -725,9 +725,9 @@ void mg_connect_resolved(struct mg_connection *c) {
   if (c->is_udp) {
     c->loc.ip = ifp->ip;
     c->loc.port = mg_htons(ifp->eport++);
-    MG_INFO(("%lu %08lx.%hu->%08lx.%hu", c->id, mg_ntohl(c->loc.ip),
-             mg_ntohs(c->loc.port), mg_ntohl(c->rem.ip),
-             mg_ntohs(c->rem.port)));
+    MG_DEBUG(("%lu %08lx.%hu->%08lx.%hu", c->id, mg_ntohl(c->loc.ip),
+              mg_ntohs(c->loc.port), mg_ntohl(c->rem.ip),
+              mg_ntohs(c->rem.port)));
   } else {
     mg_error(c, "Not implemented");
   }
@@ -752,6 +752,13 @@ static void write_conn(struct mg_connection *c) {
   }
 }
 
+static void fin_conn(struct mg_connection *c) {
+  struct mip_if *ifp = (struct mip_if *) c->mgr->priv;
+  struct tcpstate *s = (struct tcpstate *) (c + 1);
+  tx_tcp(ifp, c->rem.ip, TH_FIN | TH_ACK, c->loc.port, c->rem.port,
+         mg_htonl(s->seq), mg_htonl(s->ack), NULL, 0);
+}
+
 void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
   struct mg_connection *c, *tmp;
   uint64_t now = mg_millis();
@@ -761,7 +768,10 @@ void mg_mgr_poll(struct mg_mgr *mgr, int ms) {
     tmp = c->next;
     if (c->send.len > 0) write_conn(c);
     if (c->is_draining && c->send.len == 0) c->is_closing = 1;
-    if (c->is_closing) mg_close_conn(c);
+    if (c->is_closing) {
+      if (c->is_udp == false && c->is_listening == false) fin_conn(c);
+      mg_close_conn(c);
+    }
   }
   (void) ms;
 }

@@ -23,7 +23,7 @@ struct eth {
 
 #define BIT(x) (1UL << (x))
 #define ETH_PKT_SIZE 1540  // Max frame size
-#define ETH_DESC_CNT 2     // Descriptors count
+#define ETH_DESC_CNT 4     // Descriptors count
 #define ETH_DS 4           // Descriptor size (words)
 
 static uint32_t s_rxdesc[ETH_DESC_CNT][ETH_DS];      // RX descriptors
@@ -33,7 +33,6 @@ static uint8_t s_txbuf[ETH_DESC_CNT][ETH_PKT_SIZE];  // TX ethernet buffers
 static void (*s_rx)(void *, size_t, void *);         // Recv callback
 static void *s_rxdata;                               // Recv callback data
 static void *s_userdata;                             // Driver data
-static volatile uint32_t s_nirq, s_nrcv, s_nsnt;     // Counters
 enum { PHY_ADDR = 0, PHY_BCR = 0, PHY_BSR = 1 };     // PHY constants
 
 static inline void spin(volatile uint32_t count) {
@@ -64,14 +63,13 @@ void mip_driver_stm32_init(void *userdata) {
     s_rxdesc[i][0] = BIT(31);                       // Own
     s_rxdesc[i][1] = sizeof(s_rxbuf[i]) | BIT(14);  // 2nd address chained
     s_rxdesc[i][2] = (uint32_t) s_rxbuf[i];         // Point to data buffer
-    s_rxdesc[i][3] = (uint32_t) s_rxdesc[(i + 1) % ETH_DESC_CNT];  // Next desc
+    s_rxdesc[i][3] = (uint32_t) s_rxdesc[(i + 1) % ETH_DESC_CNT];  // Chain
   }
 
   // Init TX descriptors
   for (int i = 0; i < ETH_DESC_CNT; i++) {
-    s_txdesc[i][0] = BIT(20) | BIT(28) | BIT(29) | BIT(30);  // Chain, FS, LS
-    s_txdesc[i][2] = (uint32_t) s_txbuf[i];                  // Buf pointer
-    s_txdesc[i][3] = (uint32_t) s_txdesc[(i + 1) % ETH_DESC_CNT];  // Next desc
+    s_txdesc[i][2] = (uint32_t) s_txbuf[i];  // Buf pointer
+    s_txdesc[i][3] = (uint32_t) s_txdesc[(i + 1) % ETH_DESC_CNT];  // Chain
   }
 
   ETH->DMABMR |= BIT(0);                        // Software reset
@@ -97,22 +95,24 @@ void mip_driver_stm32_setrx(void (*rx)(void *, size_t, void *), void *rxdata) {
   s_rxdata = rxdata;
 }
 
+static uint32_t s_txno;
 size_t mip_driver_stm32_tx(const void *buf, size_t len, void *userdata) {
-  uint32_t no = s_nsnt % ETH_DESC_CNT;  // Descriptor number
-  if (len > sizeof(s_txbuf[0])) {
+  if (len > sizeof(s_txbuf[s_txno])) {
+    printf("%s: frame too big, %ld\n", __func__, (long) len);
     len = 0;  // Frame is too big
-  } else if (s_txdesc[no][0] & BIT(31)) {
-    len = 0;  // Busy, fail
+  } else if ((s_txdesc[s_txno][0] & BIT(31))) {
+    printf("%s: no free descr\n", __func__);
+    len = 0;  // All descriptors are busy, fail
   } else {
-    memcpy(s_txbuf[no], buf, len);                            // Copy data
-    s_txdesc[no][1] = (uint32_t) len;                         // Set data len
-    s_txdesc[no][0] = BIT(20) | BIT(28) | BIT(29) | BIT(30);  // Chain, FS, LS
-    s_txdesc[no][0] |= BIT(31);  // Set OWN bit - let DMA take over
-    s_nsnt++;
+    memcpy(s_txbuf[s_txno], buf, len);     // Copy data
+    s_txdesc[s_txno][1] = (uint32_t) len;  // Set data len
+    s_txdesc[s_txno][0] = BIT(20) | BIT(28) | BIT(29) | BIT(30);  // Chain,FS,LS
+    s_txdesc[s_txno][0] |= BIT(31);  // Set OWN bit - let DMA take over
+    if (++s_txno >= ETH_DESC_CNT) s_txno = 0;
   }
   uint32_t sr = ETH->DMASR;
-  if (sr & BIT(2)) ETH->DMASR = BIT(2), ETH->DMATPDR = 0;  // Un-busy
-  if (sr & BIT(5)) ETH->DMASR = BIT(5), ETH->DMATPDR = 0;  // Un-busy
+  if (sr & BIT(2)) ETH->DMASR = BIT(2), ETH->DMATPDR = 0;  // Resume
+  if (sr & BIT(5)) ETH->DMASR = BIT(5), ETH->DMATPDR = 0;  // if busy
   if (len == 0) printf("E: D0 %lx, DMASR %lx\n", s_txdesc[0][0], sr);
   return len;
   (void) userdata;
@@ -126,18 +126,15 @@ bool mip_driver_stm32_status(void *userdata) {
 
 void ETH_IRQHandler(void) {
   volatile uint32_t sr = ETH->DMASR;
-  s_nirq++;
-  while (sr & BIT(6)) {                   // Frame received, loop
-    uint32_t no = s_nrcv % ETH_DESC_CNT;  // Descriptor number
-    uint32_t len = ((s_rxdesc[no][0] >> 16) & (BIT(14) - 1));
-    if (s_rxdesc[no][0] & BIT(31)) break;
-    if (s_rx != NULL) s_rx(s_rxbuf[no], len > 4 ? len - 4 : len, s_rxdata);
-    s_rxdesc[no][0] = BIT(31);
-    s_nrcv++;
+  if (sr & BIT(6)) {  // Frame received, loop
+    for (uint32_t i = 0; i < ETH_DESC_CNT; i++) {
+      if (s_rxdesc[i][0] & BIT(31)) continue;
+      uint32_t len = ((s_rxdesc[i][0] >> 16) & (BIT(14) - 1));
+      //    printf("%lx %lu %lx %lx\n", i, len, s_rxdesc[i][0], sr);
+      if (s_rx != NULL) s_rx(s_rxbuf[i], len > 4 ? len - 4 : len, s_rxdata);
+      s_rxdesc[i][0] = BIT(31);
+    }
   }
-  // printf("  %lx %lx %lx %lx %lx\n", s_nirq, s_nrcv, s_nsnt, sr,
-  //       s_txdesc[s_nsnt % ETH_DESC_CNT][0]);
-  if ((sr & BIT(2)) || (sr & BIT(5))) ETH->DMATPDR = 0;  // Resume TX
-  if (sr & BIT(7)) ETH->DMARPDR = 0;                     // Resume RX
-  ETH->DMASR = sr & ~(BIT(2) | BIT(7));                  // Clear status
+  if (sr & BIT(7)) ETH->DMARPDR = 0;     // Resume RX
+  ETH->DMASR = sr & ~(BIT(2) | BIT(7));  // Clear status
 }

@@ -123,10 +123,6 @@ struct tcp {
   uint32_t ack;    // Acknowledgement number
   uint8_t off;     // Data offset
   uint8_t flags;   // TCP flags
-  uint16_t win;    // Window
-  uint16_t csum;   // Checksum
-  uint16_t urp;    // Urgent pointer
-} _packed;
 #define TH_FIN 0x01
 #define TH_SYN 0x02
 #define TH_RST 0x04
@@ -135,6 +131,10 @@ struct tcp {
 #define TH_URG 0x20
 #define TH_ECE 0x40
 #define TH_CWR 0x80
+  uint16_t win;   // Window
+  uint16_t csum;  // Checksum
+  uint16_t urp;   // Urgent pointer
+} _packed;
 
 struct udp {
   uint16_t sport;  // Source port
@@ -447,7 +447,7 @@ struct mg_connection *getpeer(struct mg_mgr *mgr, struct pkt *pkt, bool lsn) {
   for (c = mgr->conns; c != NULL; c = c->next) {
     if (c->is_udp && pkt->udp && c->loc.port == pkt->udp->dport) break;
     if (!c->is_udp && pkt->tcp && c->loc.port == pkt->tcp->dport &&
-        lsn == c->is_listening)
+        lsn == c->is_listening && (lsn || c->rem.port == pkt->tcp->sport))
       break;
   }
   return c;
@@ -561,19 +561,27 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
 
 static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
   struct mg_connection *c = getpeer(ifp->mgr, pkt, false);
+#if 0
+  MG_INFO(("%s %hu %p %hu %lu %hu", pkt->tcp->flags & TH_SYN ? "SYN" : "---",
+           mg_ntohs(pkt->tcp->sport), c, c ? mg_ntohs(c->loc.port) : 0,
+           mg_ntohl(pkt->tcp->ack), mg_ntohs(pkt->tcp->sport)));
+#endif
   if (c != NULL) {
-    // MG_DEBUG(("%lu %d %lx:%hx -> %lx:%hx", c->id, (int) pkt->raw.len,
-    //         pkt->ip->src, pkt->tcp->sport, pkt->ip->dst, pkt->tcp->dport));
-    // hexdump(pkt->pay.buf, pkt->pay.len);
+#if 0
+     MG_DEBUG(("%lu %d %lx:%hx -> %lx:%hx", c->id, (int) pkt->raw.len,
+             pkt->ip->src, pkt->tcp->sport, pkt->ip->dst, pkt->tcp->dport));
+     hexdump(pkt->pay.buf, pkt->pay.len);
+#endif
     read_conn(c, pkt);
   } else if ((c = getpeer(ifp->mgr, pkt, true)) == NULL) {
     tx_tcp_pkt(ifp, pkt, TH_RST | TH_ACK, pkt->tcp->ack, NULL, 0);
   } else if (pkt->tcp->flags & TH_SYN) {
     // Use peer's source port as ISN, in order to recognise the handshake
-    tx_tcp_pkt(ifp, pkt, TH_SYN | TH_ACK, pkt->tcp->sport, NULL, 0);
+    uint32_t isn = mg_htonl((uint32_t) mg_ntohs(pkt->tcp->sport));
+    tx_tcp_pkt(ifp, pkt, TH_SYN | TH_ACK, isn, NULL, 0);
   } else if (pkt->tcp->flags & TH_FIN) {
     tx_tcp_pkt(ifp, pkt, TH_FIN | TH_ACK, pkt->tcp->ack, NULL, 0);
-  } else if (pkt->tcp->ack == (0x1000000UL | pkt->tcp->sport)) {
+  } else if (mg_htonl(pkt->tcp->ack) == mg_htons(pkt->tcp->sport) + 1U) {
     accept_conn(c, pkt);
   } else {
     // Silently drop

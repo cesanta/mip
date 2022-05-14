@@ -562,9 +562,7 @@ static void read_conn(struct mg_connection *c, struct pkt *pkt) {
 static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
   struct mg_connection *c = getpeer(ifp->mgr, pkt, false);
 #if 0
-  MG_INFO(("%s %hu %p %hu %lu %hu", pkt->tcp->flags & TH_SYN ? "SYN" : "---",
-           mg_ntohs(pkt->tcp->sport), c, c ? mg_ntohs(c->loc.port) : 0,
-           mg_ntohl(pkt->tcp->ack), mg_ntohs(pkt->tcp->sport)));
+  MG_INFO(("%lu %hhu %d", c ? c->id : 0, pkt->tcp->flags, (int) pkt->pay.len));
 #endif
   if (c != NULL) {
 #if 0
@@ -584,7 +582,7 @@ static void rx_tcp(struct mip_if *ifp, struct pkt *pkt) {
   } else if (mg_htonl(pkt->tcp->ack) == mg_htons(pkt->tcp->sport) + 1U) {
     accept_conn(c, pkt);
   } else {
-    // Silently drop
+    // MG_DEBUG(("dropped silently.."));
   }
 }
 
@@ -709,7 +707,7 @@ static void on_rx(void *buf, size_t len, void *userdata) {
 
 void mip_init(struct mg_mgr *mgr, struct mip_ipcfg *ipcfg,
               struct mip_driver *driver) {
-  size_t maxpktsize = 1600, qlen = driver->rxcb ? 1024 * 16 : 0;
+  size_t maxpktsize = 1540, qlen = driver->rxcb ? 1024 * 16 : 0;
   struct mip_if *ifp =
       (struct mip_if *) calloc(1, sizeof(*ifp) + 2 * maxpktsize + qlen);
   memcpy(ifp->mac, ipcfg->mac, sizeof(ifp->mac));
@@ -736,6 +734,8 @@ void mg_connect_resolved(struct mg_connection *c) {
     MG_DEBUG(("%lu %08lx.%hu->%08lx.%hu", c->id, mg_ntohl(c->loc.ip),
               mg_ntohs(c->loc.port), mg_ntohl(c->rem.ip),
               mg_ntohs(c->rem.port)));
+    mg_call(c, MG_EV_RESOLVE, NULL);
+    mg_call(c, MG_EV_CONNECT, NULL);
   } else {
     mg_error(c, "Not implemented");
   }
@@ -750,13 +750,14 @@ bool mg_open_listener(struct mg_connection *c, const char *url) {
 static void write_conn(struct mg_connection *c) {
   struct mip_if *ifp = (struct mip_if *) c->mgr->priv;
   struct tcpstate *s = (struct tcpstate *) (c + 1);
-  size_t n = c->send.len;
+  size_t sent, n = c->send.len;
   if (n + 100 > ifp->tx.len) n = ifp->tx.len - 100;
-  n = tx_tcp(ifp, c->rem.ip, TH_PUSH | TH_ACK, c->loc.port, c->rem.port,
-             mg_htonl(s->seq), mg_htonl(s->ack), c->send.buf, n);
-  if (n > 0) {
+  sent = tx_tcp(ifp, c->rem.ip, TH_PUSH | TH_ACK, c->loc.port, c->rem.port,
+                mg_htonl(s->seq), mg_htonl(s->ack), c->send.buf, n);
+  if (sent > 0) {
     mg_iobuf_del(&c->send, 0, n);
     s->seq += n;
+    mg_call(c, MG_EV_WRITE, &n);
   }
 }
 

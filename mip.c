@@ -707,7 +707,7 @@ static void on_rx(void *buf, size_t len, void *userdata) {
 
 void mip_init(struct mg_mgr *mgr, struct mip_ipcfg *ipcfg,
               struct mip_driver *driver) {
-  size_t maxpktsize = 1540, qlen = driver->rxcb ? 1024 * 16 : 0;
+  size_t maxpktsize = 1500, qlen = driver->rxcb ? 1024 * 16 : 0;
   struct mip_if *ifp =
       (struct mip_if *) calloc(1, sizeof(*ifp) + 2 * maxpktsize + qlen);
   memcpy(ifp->mac, ipcfg->mac, sizeof(ifp->mac));
@@ -750,8 +750,8 @@ bool mg_open_listener(struct mg_connection *c, const char *url) {
 static void write_conn(struct mg_connection *c) {
   struct mip_if *ifp = (struct mip_if *) c->mgr->priv;
   struct tcpstate *s = (struct tcpstate *) (c + 1);
-  size_t sent, n = c->send.len;
-  if (n + 100 > ifp->tx.len) n = ifp->tx.len - 100;
+  size_t sent, n = c->send.len, hdrlen = 14 + 24 /*max IP*/ + 60 /*max TCP*/;
+  if (n + hdrlen > ifp->tx.len) n = ifp->tx.len - hdrlen;
   sent = tx_tcp(ifp, c->rem.ip, TH_PUSH | TH_ACK, c->loc.port, c->rem.port,
                 mg_htonl(s->seq), mg_htonl(s->ack), c->send.buf, n);
   if (sent > 0) {
